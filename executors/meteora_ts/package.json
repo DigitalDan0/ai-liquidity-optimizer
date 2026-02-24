@@ -1,0 +1,17 @@
+{
+  "name": "meteora-dlmm-executor-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional Node.js bridge for the AI Liquidity Optimizer Python MVP using Meteora DLMM TS SDK",
+  "scripts": {
+    "check": "node dlmm_executor.mjs"
+  },
+  "dependencies": {
+    "@meteora-ag/dlmm": "^1.4.0",
+    "@solana/web3.js": "^1.98.4",
+    "bn.js": "^5.2.1",
+    "bs58": "^6.0.0"
+  }
+}
+

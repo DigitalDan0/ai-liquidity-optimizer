@@ -1,0 +1,4 @@
+# Runtime uses Python standard library only for the MVP.
+# Optional (local development):
+# pytest>=8.0.0
+

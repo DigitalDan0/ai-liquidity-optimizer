@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+dist/
+build/
+*.egg-info/
+state/
+executors/meteora_ts/node_modules/
+executors/meteora_ts/package-lock.json
+
