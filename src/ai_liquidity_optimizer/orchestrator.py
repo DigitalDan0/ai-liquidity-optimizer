@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import asdict
 
 from ai_liquidity_optimizer.clients.meteora import MeteoraDlmmApiClient
 from ai_liquidity_optimizer.clients.synth import SynthInsightsClient
@@ -10,6 +9,7 @@ from ai_liquidity_optimizer.config import Settings
 from ai_liquidity_optimizer.execution.base import PositionExecutor
 from ai_liquidity_optimizer.models import BotState, ExecutionApplyRequest
 from ai_liquidity_optimizer.state_store import JsonStateStore
+from ai_liquidity_optimizer.strategy.bin_weights import compute_bin_weights_for_range, derive_mvp_bin_edges_for_range
 from ai_liquidity_optimizer.strategy.scoring import StrategyScorer, relative_range_change_bps
 
 
@@ -59,6 +59,47 @@ class OptimizerOrchestrator:
         )
 
         chosen = decision.chosen
+        weighted_bin_plan = None
+        try:
+            lp_probabilities = self.synth_client.get_lp_probabilities(
+                asset=self.settings.synth_asset,
+                horizon=self.settings.synth_horizon,
+                days=self.settings.synth_days,
+            )
+
+            prediction_percentiles = None
+            try:
+                prediction_percentiles = self.synth_client.get_prediction_percentiles(asset=self.settings.synth_asset)
+            except Exception as exc:  # pragma: no cover - best-effort optional endpoint
+                LOGGER.warning("prediction-percentiles unavailable; using terminal-only bin weights: %s", exc)
+
+            bin_edges, binning_mode = derive_mvp_bin_edges_for_range(
+                pool=pool,
+                range_lower=chosen.forecast.lower_bound,
+                range_upper=chosen.forecast.upper_bound,
+                target_bin_count=24,
+            )
+            weighted_bin_plan = compute_bin_weights_for_range(
+                forecast=chosen.forecast,
+                horizon=self.settings.synth_horizon,
+                bin_edges=bin_edges,
+                current_price=pool.current_price_sol_usdc(),
+                lp_probabilities=lp_probabilities,
+                prediction_percentiles=prediction_percentiles,
+                binning_mode=binning_mode,
+            )
+            top_weight = max(weighted_bin_plan.weights) if weighted_bin_plan.weights else 0.0
+            LOGGER.info(
+                "Computed %d bin weights (mode=%s, fallback=%s, max_w=%.4f, path=%s)",
+                len(weighted_bin_plan.weights),
+                weighted_bin_plan.diagnostics.binning_mode,
+                weighted_bin_plan.diagnostics.fallback_reason,
+                top_weight,
+                weighted_bin_plan.diagnostics.used_prediction_percentiles,
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to compute Synth-driven bin weights; continuing without them: %s", exc)
+
         should_rebalance, reason = _should_rebalance(
             state=state,
             pool_address=pool.address,
@@ -90,6 +131,8 @@ class OptimizerOrchestrator:
                     deposit_sol_amount=self.settings.deposit_sol_amount,
                     deposit_usdc_amount=self.settings.deposit_usdc_amount,
                     existing_position=state.active_position,
+                    target_bin_edges=weighted_bin_plan.bin_edges if weighted_bin_plan else None,
+                    target_bin_weights=weighted_bin_plan.weights if weighted_bin_plan else None,
                 )
             )
             if execution_result.active_position is not None:
@@ -107,6 +150,7 @@ class OptimizerOrchestrator:
             },
             "horizon": decision.horizon,
             "chosen": chosen.to_dict(),
+            "bin_weight_plan": weighted_bin_plan.to_dict() if weighted_bin_plan else None,
             "top_candidates": [c.to_dict() for c in decision.ranked[:5]],
             "rebalance": {
                 "should_rebalance": should_rebalance,
@@ -140,4 +184,3 @@ def _should_rebalance(
     if delta_bps >= threshold_bps:
         return True, f"range_changed_{delta_bps:.2f}bps"
     return False, f"range_change_below_threshold_{delta_bps:.2f}bps"
-

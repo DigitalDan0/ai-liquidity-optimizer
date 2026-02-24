@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+
+from ai_liquidity_optimizer.compat import dataclass
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
@@ -122,4 +123,3 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
     )
     settings.validate()
     return settings
-

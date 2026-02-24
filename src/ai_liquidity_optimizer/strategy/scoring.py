@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
+from ai_liquidity_optimizer.compat import dataclass
 from ai_liquidity_optimizer.models import MeteoraPoolSnapshot, ScoredCandidate, StrategyDecision, SynthLpBoundForecast, normalize_fraction
 
 
@@ -88,4 +88,3 @@ def relative_range_change_bps(
     lower_change = abs(new_lower - current_lower) / current_mid
     upper_change = abs(new_upper - current_upper) / current_mid
     return max(lower_change, upper_change) * 10_000.0
-

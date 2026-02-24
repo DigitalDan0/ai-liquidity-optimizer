@@ -15,6 +15,15 @@ class JsonHttpClient:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
+        self.default_headers = {
+            # Some APIs (including Meteora's data API) may reject Python's default urllib UA.
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+        }
 
     def get_json(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any:
         final_url = url
@@ -24,7 +33,10 @@ class JsonHttpClient:
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
-            req = request.Request(final_url, headers=headers or {}, method="GET")
+            request_headers = dict(self.default_headers)
+            if headers:
+                request_headers.update(headers)
+            req = request.Request(final_url, headers=request_headers, method="GET")
             try:
                 with request.urlopen(req, timeout=self.timeout_seconds) as resp:
                     body = resp.read().decode("utf-8")
@@ -39,4 +51,3 @@ class JsonHttpClient:
 
         assert last_error is not None
         raise RuntimeError(f"GET {final_url} failed: {last_error}") from last_error
-

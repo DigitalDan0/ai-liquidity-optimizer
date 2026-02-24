@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, field
 from datetime import datetime, timezone
 from typing import Any
+
+from ai_liquidity_optimizer.compat import dataclass
 
 
 def utc_now_iso() -> str:
@@ -21,6 +23,58 @@ class SynthLpBoundForecast:
     @property
     def mid_price(self) -> float:
         return (self.lower_bound + self.upper_bound) / 2.0
+
+
+@dataclass(slots=True)
+class SynthLpProbabilityPoint:
+    price: float
+    probability_below: float | None = None
+    probability_above: float | None = None
+
+
+@dataclass(slots=True)
+class SynthLpProbabilitiesSnapshot:
+    asset: str
+    horizon: str
+    points: list[SynthLpProbabilityPoint]
+    current_price: float | None = None
+    as_of: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "asset": self.asset,
+            "horizon": self.horizon,
+            "current_price": self.current_price,
+            "as_of": self.as_of,
+            "points": [
+                {
+                    "price": p.price,
+                    "probability_below": p.probability_below,
+                    "probability_above": p.probability_above,
+                }
+                for p in self.points
+            ],
+        }
+
+
+@dataclass(slots=True)
+class SynthPredictionPercentilesSnapshot:
+    asset: str
+    percentiles_by_step: list[dict[float, float]]
+    current_price: float | None = None
+    step_minutes: int = 5
+    as_of: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "asset": self.asset,
+            "current_price": self.current_price,
+            "step_minutes": self.step_minutes,
+            "as_of": self.as_of,
+            "num_steps": len(self.percentiles_by_step),
+        }
 
 
 @dataclass(slots=True)
@@ -50,6 +104,17 @@ class MeteoraPoolSnapshot:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         return data
+
+    def current_price_sol_usdc(self) -> float:
+        sx = self.symbol_x.upper()
+        sy = self.symbol_y.upper()
+        if self.current_price <= 0:
+            return 0.0
+        if sx == "SOL" and sy == "USDC":
+            return self.current_price
+        if sx == "USDC" and sy == "SOL":
+            return 1.0 / self.current_price
+        return self.current_price
 
 
 @dataclass(slots=True)
@@ -83,6 +148,58 @@ class StrategyDecision:
     ranked: list[ScoredCandidate]
     horizon: str
     generated_at: str = field(default_factory=utc_now_iso)
+
+
+@dataclass(slots=True)
+class BinWeightingConfig:
+    tau_half_minutes: int = 90
+    alpha: float = 1.15
+    eps: float = 1e-6
+    low_mass_threshold: float = 0.02
+    terminal_mass_weight_no_path: float = 0.85
+    proximity_weight_no_path: float = 0.15
+    path_weight: float = 0.60
+    terminal_mass_weight_with_path: float = 0.30
+    proximity_weight_with_path: float = 0.10
+    final_floor_blend: float = 0.08
+    sigma_range_scale: float = 0.35
+    sigma_min: float = 0.005
+
+
+@dataclass(slots=True)
+class BinWeightingDiagnostics:
+    mass_in_range: float
+    used_prediction_percentiles: bool
+    fallback_reason: str | None
+    confidence_factor: float
+    t_frac: float
+    entropy: float
+    terminal_cdf_points: int
+    num_bins: int
+    binning_mode: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class WeightedBinPlan:
+    range_lower: float
+    range_upper: float
+    bin_edges: list[float]
+    weights: list[float]
+    diagnostics: BinWeightingDiagnostics
+    distribution_components: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "range_lower": self.range_lower,
+            "range_upper": self.range_upper,
+            "bin_edges": self.bin_edges,
+            "weights": self.weights,
+            "diagnostics": self.diagnostics.to_dict(),
+            "distribution_components": self.distribution_components,
+        }
 
 
 @dataclass(slots=True)
@@ -126,6 +243,8 @@ class ExecutionApplyRequest:
     deposit_sol_amount: float
     deposit_usdc_amount: float
     existing_position: ActivePositionState | None
+    target_bin_edges: list[float] | None = None
+    target_bin_weights: list[float] | None = None
 
 
 @dataclass(slots=True)
@@ -144,4 +263,3 @@ def normalize_fraction(value: float) -> float:
         if value <= 100.0:
             return value / 100.0
     return value
-
