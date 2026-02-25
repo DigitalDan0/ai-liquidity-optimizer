@@ -93,12 +93,21 @@ class MeteoraPoolSnapshot:
     fees_24h: float
     fee_tvl_ratio_24h: float | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    tvl: float | None = None
+    bin_step_bps: float | None = None
+    base_fee_pct: float | None = None
+    dynamic_fee_pct: float | None = None
+    fee_tvl_ratio_by_window: dict[str, float] = field(default_factory=dict)
+    volume_by_window: dict[str, float] = field(default_factory=dict)
+    fees_by_window: dict[str, float] = field(default_factory=dict)
+    is_blacklisted: bool = False
 
     def fee_return_fraction_24h(self) -> float:
         if self.fee_tvl_ratio_24h is not None:
             return normalize_fraction(self.fee_tvl_ratio_24h)
-        if self.liquidity > 0 and self.fees_24h >= 0:
-            return self.fees_24h / self.liquidity
+        tvl = self.tvl_usd()
+        if tvl > 0 and self.fees_24h >= 0:
+            return self.fees_24h / tvl
         return 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -115,6 +124,44 @@ class MeteoraPoolSnapshot:
         if sx == "USDC" and sy == "SOL":
             return 1.0 / self.current_price
         return self.current_price
+
+    def tvl_usd(self) -> float:
+        if self.tvl is not None and self.tvl > 0:
+            return float(self.tvl)
+        return float(self.liquidity)
+
+    def fee_tvl_ratio_fraction(self, window: str) -> float | None:
+        if window == "24h" and self.fee_tvl_ratio_24h is not None:
+            return normalize_fraction(self.fee_tvl_ratio_24h)
+        value = self.fee_tvl_ratio_by_window.get(window)
+        if value is None:
+            return None
+        return normalize_fraction(value)
+
+    def volume_window(self, window: str) -> float:
+        if window == "24h" and self.volume_24h > 0:
+            return float(self.volume_24h)
+        return float(self.volume_by_window.get(window) or 0.0)
+
+    def fees_window(self, window: str) -> float:
+        if window == "24h" and self.fees_24h > 0:
+            return float(self.fees_24h)
+        return float(self.fees_by_window.get(window) or 0.0)
+
+    def realized_fee_rate_15m_fraction_proxy(self) -> float:
+        one_h = self.fee_tvl_ratio_fraction("1h")
+        day = self.fee_tvl_ratio_fraction("24h")
+        if one_h is not None:
+            short = one_h * (15.0 / 60.0)
+            if day is not None:
+                return max(0.0, 0.7 * short + 0.3 * (day * (15.0 / 1440.0)))
+            return max(0.0, short)
+        if day is not None:
+            return max(0.0, day * (15.0 / 1440.0))
+        tvl = self.tvl_usd()
+        if tvl > 0 and self.fees_24h > 0:
+            return max(0.0, (self.fees_24h / tvl) * (15.0 / 1440.0))
+        return 0.0
 
 
 @dataclass(slots=True)
@@ -199,6 +246,79 @@ class WeightedBinPlan:
             "weights": self.weights,
             "diagnostics": self.diagnostics.to_dict(),
             "distribution_components": self.distribution_components,
+        }
+
+
+@dataclass(slots=True)
+class EvComponentBreakdown:
+    expected_fees_usd: float
+    expected_il_usd: float
+    rebalance_cost_usd: float
+    pool_switch_extra_cost_usd: float
+    active_occupancy_15m: float
+    concentration_factor: float
+    fee_rate_15m_fraction: float
+    capital_usd: float
+    il_15m_fraction: float
+    occupancy_source: str | None = None
+    baseline_mode: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EvScoredCandidate:
+    pool_address: str
+    pool_name: str
+    pool_symbol_pair: str
+    pool_current_price_sol_usdc: float
+    forecast: SynthLpBoundForecast
+    weighted_bin_plan: WeightedBinPlan
+    ev_15m_usd: float
+    ev_components: EvComponentBreakdown
+    pre_rank_score: float | None = None
+    rebalance_structural_change: bool = True
+    pool_switch: bool = False
+    range_change_bps_vs_active: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pool_address": self.pool_address,
+            "pool_name": self.pool_name,
+            "pool_symbol_pair": self.pool_symbol_pair,
+            "pool_current_price_sol_usdc": self.pool_current_price_sol_usdc,
+            "forecast": {
+                "width_pct": self.forecast.width_pct,
+                "lower_bound": self.forecast.lower_bound,
+                "upper_bound": self.forecast.upper_bound,
+                "probability_to_stay_in_interval": self.forecast.probability_to_stay_in_interval,
+                "expected_time_in_interval_minutes": self.forecast.expected_time_in_interval_minutes,
+                "expected_impermanent_loss": self.forecast.expected_impermanent_loss,
+            },
+            "weighted_bin_plan": self.weighted_bin_plan.to_dict(),
+            "ev_15m_usd": self.ev_15m_usd,
+            "ev_components": self.ev_components.to_dict(),
+            "pre_rank_score": self.pre_rank_score,
+            "rebalance_structural_change": self.rebalance_structural_change,
+            "pool_switch": self.pool_switch,
+            "range_change_bps_vs_active": self.range_change_bps_vs_active,
+        }
+
+
+@dataclass(slots=True)
+class PoolPreScore:
+    pool_address: str
+    pool_name: str
+    score: float
+    components: dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pool_address": self.pool_address,
+            "pool_name": self.pool_name,
+            "score": self.score,
+            "components": self.components,
         }
 
 

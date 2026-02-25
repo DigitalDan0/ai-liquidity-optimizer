@@ -225,6 +225,9 @@ def compute_time_decayed_occupancy_from_percentiles(
     bin_edges: list[float],
     prediction_percentiles: SynthPredictionPercentilesSnapshot,
     tau_half_minutes: int = 90,
+    max_horizon_minutes: int | None = None,
+    normalize_steps: bool = True,
+    normalize_output: bool = True,
 ) -> list[float] | None:
     edges = _validate_and_normalize_bin_edges(bin_edges)
     num_bins = len(edges) - 1
@@ -240,6 +243,9 @@ def compute_time_decayed_occupancy_from_percentiles(
     for step_index, row in enumerate(prediction_percentiles.percentiles_by_step):
         if not isinstance(row, dict) or len(row) < 2:
             continue
+        t_minutes = step_index * prediction_percentiles.step_minutes
+        if max_horizon_minutes is not None and t_minutes > max_horizon_minutes:
+            break
         sorted_quantiles = sorted((float(p), float(v)) for p, v in row.items() if 0.0 <= float(p) <= 100.0 and float(v) > 0.0)
         if len(sorted_quantiles) < 2:
             continue
@@ -268,15 +274,43 @@ def compute_time_decayed_occupancy_from_percentiles(
         step_total = sum(step_occupancy)
         if step_total <= 0:
             continue
-        t_minutes = step_index * prediction_percentiles.step_minutes
         decay = math.exp(-ln2 * (t_minutes / float(tau_half_minutes)))
         total_decay += decay
         for i in range(num_bins):
-            accum[i] += decay * (step_occupancy[i] / step_total)
+            if normalize_steps:
+                accum[i] += decay * (step_occupancy[i] / step_total)
+            else:
+                accum[i] += decay * step_occupancy[i]
 
     if total_decay <= 0:
         return None
-    return _normalize(accum)
+    if normalize_steps:
+        return _normalize(accum) if normalize_output else [v / total_decay for v in accum]
+    averaged = [v / total_decay for v in accum]
+    return _normalize(averaged) if normalize_output else averaged
+
+
+def compute_weighted_active_occupancy_from_percentiles(
+    *,
+    bin_edges: list[float],
+    bin_weights: list[float],
+    prediction_percentiles: SynthPredictionPercentilesSnapshot,
+    tau_half_minutes: int,
+    max_horizon_minutes: int,
+) -> float | None:
+    occupancy = compute_time_decayed_occupancy_from_percentiles(
+        bin_edges=bin_edges,
+        prediction_percentiles=prediction_percentiles,
+        tau_half_minutes=tau_half_minutes,
+        max_horizon_minutes=max_horizon_minutes,
+        normalize_steps=False,
+        normalize_output=False,
+    )
+    if occupancy is None:
+        return None
+    if len(bin_weights) != len(occupancy) or not occupancy:
+        return None
+    return _clamp(sum(max(0.0, float(w)) * max(0.0, occ) for w, occ in zip(bin_weights, occupancy)), 0.0, 1.0)
 
 
 def _terminal_mass_per_bin(cdf: TerminalCdf, edges: list[float]) -> list[float]:

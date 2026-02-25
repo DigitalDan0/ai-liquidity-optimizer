@@ -49,6 +49,8 @@ def _merged_env(env_file: Path | None) -> Mapping[str, str]:
 
 @dataclass(slots=True)
 class Settings:
+    ev_mode: bool
+    ev_horizon_minutes: int
     synth_api_key: str | None
     synth_base_url: str
     synth_asset: str
@@ -63,6 +65,16 @@ class Settings:
     range_change_threshold_bps: float
     max_candidates: int
     fee_window: str
+    rebalance_cost_usd: float
+    pool_switch_extra_cost_usd: float
+    min_ev_improvement_usd: float
+    pool_candidate_limit: int
+    min_pool_tvl_usd: float
+    top_k_ranges_per_pool: int
+    ev_percentile_decay_half_life_minutes: int
+    ev_concentration_gamma: float
+    ev_concentration_min: float
+    ev_concentration_max: float
     executor: str
     deposit_sol_amount: float
     deposit_usdc_amount: float
@@ -79,6 +91,16 @@ class Settings:
             raise ValueError("EXECUTOR must be 'dry-run' or 'meteora-node'.")
         if self.rebalance_interval_minutes <= 0:
             raise ValueError("REBALANCE_INTERVAL_MINUTES must be > 0.")
+        if self.ev_horizon_minutes <= 0:
+            raise ValueError("EV_HORIZON_MINUTES must be > 0.")
+        if self.pool_candidate_limit <= 0:
+            raise ValueError("POOL_CANDIDATE_LIMIT must be > 0.")
+        if self.top_k_ranges_per_pool <= 0:
+            raise ValueError("TOP_K_RANGES_PER_POOL must be > 0.")
+        if self.ev_concentration_min <= 0 or self.ev_concentration_max <= 0:
+            raise ValueError("EV concentration bounds must be > 0.")
+        if self.ev_concentration_min > self.ev_concentration_max:
+            raise ValueError("EV_CONCENTRATION_MIN cannot exceed EV_CONCENTRATION_MAX.")
         if self.executor == "meteora-node":
             missing = []
             if not self.solana_rpc_url:
@@ -98,10 +120,12 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
         state_path = repo_root / state_path
 
     settings = Settings(
+        ev_mode=_parse_bool(env.get("EV_MODE"), True),
+        ev_horizon_minutes=_parse_int(env.get("EV_HORIZON_MINUTES"), 15),
         synth_api_key=env.get("SYNTH_API_KEY"),
         synth_base_url=env.get("SYNTH_BASE_URL", "https://api.synthdata.co").rstrip("/"),
         synth_asset=env.get("SYNTH_ASSET", "SOL").upper(),
-        synth_horizon=env.get("SYNTH_HORIZON", "24h"),
+        synth_horizon=env.get("SYNTH_HORIZON", "1h" if _parse_bool(env.get("EV_MODE"), True) else "24h"),
         synth_days=_parse_int(env.get("SYNTH_DAYS"), 30),
         synth_limit=_parse_int(env.get("SYNTH_LIMIT"), 20),
         meteora_api_base_url=env.get("METEORA_API_BASE_URL", "https://dlmm.datapi.meteora.ag").rstrip("/"),
@@ -112,6 +136,16 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
         range_change_threshold_bps=_parse_float(env.get("RANGE_CHANGE_THRESHOLD_BPS"), 25.0),
         max_candidates=_parse_int(env.get("MAX_CANDIDATES"), 12),
         fee_window=env.get("FEE_WINDOW", "24h"),
+        rebalance_cost_usd=_parse_float(env.get("REBALANCE_COST_USD"), 0.50),
+        pool_switch_extra_cost_usd=_parse_float(env.get("POOL_SWITCH_EXTRA_COST_USD"), 1.00),
+        min_ev_improvement_usd=_parse_float(env.get("MIN_EV_IMPROVEMENT_USD"), 0.25),
+        pool_candidate_limit=_parse_int(env.get("POOL_CANDIDATE_LIMIT"), 12),
+        min_pool_tvl_usd=_parse_float(env.get("MIN_POOL_TVL_USD"), 100000.0),
+        top_k_ranges_per_pool=_parse_int(env.get("TOP_K_RANGES_PER_POOL"), 3),
+        ev_percentile_decay_half_life_minutes=_parse_int(env.get("EV_PERCENTILE_DECAY_HALF_LIFE_MINUTES"), 15),
+        ev_concentration_gamma=_parse_float(env.get("EV_CONCENTRATION_GAMMA"), 0.6),
+        ev_concentration_min=_parse_float(env.get("EV_CONCENTRATION_MIN"), 0.70),
+        ev_concentration_max=_parse_float(env.get("EV_CONCENTRATION_MAX"), 2.25),
         executor=env.get("EXECUTOR", "dry-run"),
         deposit_sol_amount=_parse_float(env.get("DEPOSIT_SOL_AMOUNT"), 0.10),
         deposit_usdc_amount=_parse_float(env.get("DEPOSIT_USDC_AMOUNT"), 20.0),

@@ -62,20 +62,42 @@ class MeteoraDlmmApiClient:
         candidates.sort(key=lambda p: (p.liquidity, p.volume_24h), reverse=True)
         return candidates[0]
 
+    def list_sol_usdc_pool_candidates(
+        self,
+        *,
+        query: str = "SOL/USDC",
+        per_page: int = 200,
+        min_tvl_usd: float = 0.0,
+    ) -> list[MeteoraPoolSnapshot]:
+        pools = self.list_pools(query=query, per_page=per_page)
+        candidates = [p for p in pools if _is_sol_usdc_pair(p)]
+        if not candidates:
+            pools = self.list_pools(query="SOL", per_page=max(per_page, 200))
+            candidates = [p for p in pools if _is_sol_usdc_pair(p)]
+
+        filtered: list[MeteoraPoolSnapshot] = []
+        for pool in candidates:
+            if pool.is_blacklisted:
+                continue
+            if pool.tvl_usd() < min_tvl_usd:
+                continue
+            filtered.append(pool)
+
+        filtered.sort(key=lambda p: (p.tvl_usd(), p.volume_24h), reverse=True)
+        return filtered
+
     def _parse_pool(self, raw: dict[str, Any]) -> MeteoraPoolSnapshot:
         token_x = raw.get("mint_x") or raw.get("token_x") or {}
         token_y = raw.get("mint_y") or raw.get("token_y") or {}
         fee_tvl_ratio = raw.get("fee_tvl_ratio")
-        fee_tvl_ratio_24h = None
-        if isinstance(fee_tvl_ratio, dict) and "24h" in fee_tvl_ratio:
-            try:
-                fee_tvl_ratio_24h = float(fee_tvl_ratio["24h"])
-            except (TypeError, ValueError):
-                fee_tvl_ratio_24h = None
+        fee_tvl_ratio_map = _parse_metric_window_map(fee_tvl_ratio)
+        fee_tvl_ratio_24h = fee_tvl_ratio_map.get("24h")
 
         volume = raw.get("volume") if isinstance(raw.get("volume"), dict) else {}
         fees = raw.get("fees") if isinstance(raw.get("fees"), dict) else {}
         pool_config = raw.get("pool_config") if isinstance(raw.get("pool_config"), dict) else None
+        volume_map = _parse_metric_window_map(volume)
+        fees_map = _parse_metric_window_map(fees)
 
         liquidity = raw.get("liquidity")
         if liquidity is None:
@@ -88,6 +110,27 @@ class MeteoraDlmmApiClient:
         fees_24h = raw.get("fees_24h")
         if fees_24h is None and fees:
             fees_24h = fees.get("24h")
+
+        bin_step_bps = None
+        base_fee_pct = None
+        dynamic_fee_pct = None
+        if pool_config:
+            try:
+                bin_step_bps = float(pool_config.get("bin_step")) if pool_config.get("bin_step") is not None else None
+            except (TypeError, ValueError):
+                bin_step_bps = None
+            try:
+                base_fee_pct = float(pool_config.get("base_fee_pct")) if pool_config.get("base_fee_pct") is not None else None
+            except (TypeError, ValueError):
+                base_fee_pct = None
+        try:
+            dynamic_fee_pct = float(raw.get("dynamic_fee_pct")) if raw.get("dynamic_fee_pct") is not None else None
+        except (TypeError, ValueError):
+            dynamic_fee_pct = None
+
+        tvl = raw.get("tvl")
+        if tvl is None:
+            tvl = liquidity
 
         return MeteoraPoolSnapshot(
             address=str(raw.get("address") or raw.get("pool_address") or ""),
@@ -104,6 +147,14 @@ class MeteoraDlmmApiClient:
             fees_24h=float(fees_24h or 0.0),
             fee_tvl_ratio_24h=fee_tvl_ratio_24h,
             raw={**raw, "_pool_config": pool_config} if pool_config else raw,
+            tvl=float(tvl or 0.0),
+            bin_step_bps=bin_step_bps,
+            base_fee_pct=base_fee_pct,
+            dynamic_fee_pct=dynamic_fee_pct,
+            fee_tvl_ratio_by_window=fee_tvl_ratio_map,
+            volume_by_window=volume_map,
+            fees_by_window=fees_map,
+            is_blacklisted=bool(raw.get("is_blacklisted", False)),
         )
 
 
@@ -127,6 +178,18 @@ def _extract_pools(payload: Any) -> list[dict[str, Any]]:
 def _is_sol_usdc_pair(pool: MeteoraPoolSnapshot) -> bool:
     symbols = {pool.symbol_x.upper(), pool.symbol_y.upper()}
     return symbols == {"SOL", "USDC"}
+
+
+def _parse_metric_window_map(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, float] = {}
+    for k, v in value.items():
+        try:
+            out[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _meteora_headers() -> dict[str, str]:

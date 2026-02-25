@@ -13,6 +13,7 @@ from ai_liquidity_optimizer.execution.dry_run import DryRunExecutor
 from ai_liquidity_optimizer.execution.meteora_node_bridge import MeteoraNodeBridgeExecutor
 from ai_liquidity_optimizer.orchestrator import OptimizerOrchestrator
 from ai_liquidity_optimizer.state_store import JsonStateStore
+from ai_liquidity_optimizer.strategy.ev import EvLpScorer
 from ai_liquidity_optimizer.strategy.scoring import StrategyScorer
 
 
@@ -46,6 +47,17 @@ def main(argv: list[str] | None = None) -> int:
     synth_client = SynthInsightsClient(settings.synth_base_url, settings.synth_api_key or "")
     meteora_client = MeteoraDlmmApiClient(settings.meteora_api_base_url)
     scorer = StrategyScorer(min_stay_probability=settings.min_stay_probability)
+    ev_scorer = EvLpScorer(
+        ev_horizon_minutes=settings.ev_horizon_minutes,
+        rebalance_cost_usd=settings.rebalance_cost_usd,
+        pool_switch_extra_cost_usd=settings.pool_switch_extra_cost_usd,
+        min_ev_improvement_usd=settings.min_ev_improvement_usd,
+        ev_percentile_decay_half_life_minutes=settings.ev_percentile_decay_half_life_minutes,
+        ev_concentration_gamma=settings.ev_concentration_gamma,
+        ev_concentration_min=settings.ev_concentration_min,
+        ev_concentration_max=settings.ev_concentration_max,
+        min_stay_probability=settings.min_stay_probability,
+    )
     state_store = JsonStateStore(settings.state_path)
 
     if settings.executor == "dry-run":
@@ -62,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         synth_client=synth_client,
         meteora_client=meteora_client,
         scorer=scorer,
+        ev_scorer=ev_scorer,
         executor=executor,
         state_store=state_store,
     )
@@ -104,6 +117,57 @@ def _persist_once_result(result: dict[str, Any], state_path: Path) -> dict[str, 
 
 
 def _summarize_once_result(result: dict[str, Any]) -> str:
+    if bool(result.get("ev_mode")) or isinstance(result.get("ev_best_candidate"), dict):
+        return _summarize_once_result_ev(result)
+    return _summarize_once_result_proxy(result)
+
+
+def _summarize_once_result_ev(result: dict[str, Any]) -> str:
+    pool = result.get("selected_pool") if isinstance(result.get("selected_pool"), dict) else {}
+    if not pool:
+        pool = result.get("pool") if isinstance(result.get("pool"), dict) else {}
+    chosen = result.get("chosen") if isinstance(result.get("chosen"), dict) else {}
+    rebalance = result.get("rebalance") if isinstance(result.get("rebalance"), dict) else {}
+    gate = result.get("rebalance_gate") if isinstance(result.get("rebalance_gate"), dict) else {}
+    best = result.get("ev_best_candidate") if isinstance(result.get("ev_best_candidate"), dict) else {}
+    best_components = best.get("ev_components") if isinstance(best.get("ev_components"), dict) else {}
+    hold = result.get("ev_current_hold") if isinstance(result.get("ev_current_hold"), dict) else {}
+    bin_plan = result.get("bin_weight_plan") if isinstance(result.get("bin_weight_plan"), dict) else {}
+    diagnostics = bin_plan.get("diagnostics") if isinstance(bin_plan.get("diagnostics"), dict) else {}
+    top_bins = _format_top_bins(bin_plan=bin_plan, limit=5)
+
+    ev_best = best.get("ev_15m_usd", chosen.get("ev_15m_usd", chosen.get("score")))
+    ev_hold = hold.get("ev_15m_usd")
+    ev_delta = result.get("ev_delta_usd")
+
+    return (
+        "RUN_ONCE_EV "
+        f"ts={result.get('timestamp')} "
+        f"h={result.get('horizon')} "
+        f"pool={pool.get('name')}[{str(pool.get('address') or '')[:8]}]@{_fmt_num(pool.get('current_price'), 4)} "
+        f"range=[{_fmt_num(chosen.get('lower_bound'), 4)},{_fmt_num(chosen.get('upper_bound'), 4)}] "
+        f"w={_fmt_num(chosen.get('width_pct'), 2)}% "
+        f"EV15m={_fmt_num(ev_best, 4)} "
+        f"hold={_fmt_num(ev_hold, 4)} "
+        f"delta={_fmt_num(ev_delta, 4)} "
+        f"fees={_fmt_num(best_components.get('expected_fees_usd'), 4)} "
+        f"il={_fmt_num(best_components.get('expected_il_usd'), 4)} "
+        f"cost={_fmt_num(best_components.get('rebalance_cost_usd'), 4)}+{_fmt_num(best_components.get('pool_switch_extra_cost_usd'), 4)} "
+        f"occ={_fmt_num(best_components.get('active_occupancy_15m'), 3)} "
+        f"conc={_fmt_num(best_components.get('concentration_factor'), 3)} "
+        f"fee_rate15m={_fmt_num(best_components.get('fee_rate_15m_fraction'), 6)} "
+        f"bins={diagnostics.get('num_bins', '?')} "
+        f"path={diagnostics.get('used_prediction_percentiles', False)} "
+        f"fallback={diagnostics.get('fallback_reason')} "
+        f"mass={_fmt_num(diagnostics.get('mass_in_range'), 4)} "
+        f"switch={best.get('pool_switch')} "
+        f"gate=ev:{gate.get('ev_threshold_passed')} structural:{gate.get('structural_change_passed')} "
+        f"rebalance={rebalance.get('should_rebalance')}({rebalance.get('reason')}) "
+        f"top_bins={top_bins}"
+    )
+
+
+def _summarize_once_result_proxy(result: dict[str, Any]) -> str:
     pool = result.get("pool") if isinstance(result.get("pool"), dict) else {}
     chosen = result.get("chosen") if isinstance(result.get("chosen"), dict) else {}
     rebalance = result.get("rebalance") if isinstance(result.get("rebalance"), dict) else {}
