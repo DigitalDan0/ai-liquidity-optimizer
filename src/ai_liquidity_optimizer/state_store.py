@@ -34,6 +34,7 @@ class JsonStateStore:
         return BotState(
             active_position=active,
             last_decision=raw.get("last_decision") if isinstance(raw.get("last_decision"), dict) else None,
+            strategy_state=dict(raw.get("strategy_state") or {}),
             updated_at=str(raw.get("updated_at") or utc_now_iso()),
         )
 
@@ -44,4 +45,3 @@ class JsonStateStore:
         payload["updated_at"] = utc_now_iso()
         tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         tmp_path.replace(self.path)
-

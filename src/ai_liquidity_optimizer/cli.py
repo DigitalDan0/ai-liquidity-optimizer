@@ -56,6 +56,26 @@ def main(argv: list[str] | None = None) -> int:
         ev_concentration_gamma=settings.ev_concentration_gamma,
         ev_concentration_min=settings.ev_concentration_min,
         ev_concentration_max=settings.ev_concentration_max,
+        ev_capture_kappa=settings.ev_capture_kappa,
+        ev_capture_min=settings.ev_capture_min,
+        ev_capture_max=settings.ev_capture_max,
+        ev_capture_eps=settings.ev_capture_eps,
+        ev_oor_penalty_enabled=settings.ev_oor_penalty_enabled,
+        ev_oor_penalize_hold_only=settings.ev_oor_penalize_hold_only,
+        ev_oor_deadband_bps=settings.ev_oor_deadband_bps,
+        ev_oor_ref_bps=settings.ev_oor_ref_bps,
+        ev_oor_base_penalty_fraction_15m=settings.ev_oor_base_penalty_fraction_15m,
+        ev_oor_max_penalty_fraction_15m=settings.ev_oor_max_penalty_fraction_15m,
+        ev_oor_persistence_step=settings.ev_oor_persistence_step,
+        ev_oor_persistence_cap_cycles=settings.ev_oor_persistence_cap_cycles,
+        ev_il_drift_alpha=settings.ev_il_drift_alpha,
+        ev_il_oor_beta=settings.ev_il_oor_beta,
+        ev_il_onesided_gamma=settings.ev_il_onesided_gamma,
+        ev_il_persistence_delta=settings.ev_il_persistence_delta,
+        ev_il_mult_min=settings.ev_il_mult_min,
+        ev_il_mult_max=settings.ev_il_mult_max,
+        ev_il_drift_ref_bps=settings.ev_il_drift_ref_bps,
+        ev_il_drift_horizon_minutes=settings.ev_il_drift_horizon_minutes,
         min_stay_probability=settings.min_stay_probability,
     )
     state_store = JsonStateStore(settings.state_path)
@@ -67,6 +87,10 @@ def main(argv: list[str] | None = None) -> int:
             repo_root=repo_root,
             rpc_url=settings.solana_rpc_url or "",
             private_key_b58=settings.solana_private_key_b58 or "",
+            liquidity_mode=settings.meteora_liquidity_mode,
+            max_custom_weight_position_bins=settings.max_custom_weight_position_bins,
+            synth_weight_active_bin_floor_bps=settings.synth_weight_active_bin_floor_bps,
+            synth_weight_max_bin_bps_per_side=settings.synth_weight_max_bin_bps_per_side,
         )
 
     orchestrator = OptimizerOrchestrator(
@@ -84,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         save_paths = _persist_once_result(result=result, state_path=settings.state_path)
         LOGGER.info(_summarize_once_result(result))
         LOGGER.info(
-            "Saved full dry-run result for later review: latest=%s history=%s",
+            "Saved full run result for later review: latest=%s history=%s",
             save_paths["latest"],
             save_paths["history"],
         )
@@ -132,37 +156,65 @@ def _summarize_once_result_ev(result: dict[str, Any]) -> str:
     best = result.get("ev_best_candidate") if isinstance(result.get("ev_best_candidate"), dict) else {}
     best_components = best.get("ev_components") if isinstance(best.get("ev_components"), dict) else {}
     hold = result.get("ev_current_hold") if isinstance(result.get("ev_current_hold"), dict) else {}
-    bin_plan = result.get("bin_weight_plan") if isinstance(result.get("bin_weight_plan"), dict) else {}
+    active_position = result.get("active_position") if isinstance(result.get("active_position"), dict) else {}
+    cost_model = result.get("cost_model") if isinstance(result.get("cost_model"), dict) else {}
+    execution_config = result.get("execution_config") if isinstance(result.get("execution_config"), dict) else {}
+    execution_plan = result.get("execution_bin_weight_plan") if isinstance(result.get("execution_bin_weight_plan"), dict) else {}
+    bin_plan = execution_plan if execution_plan else (result.get("bin_weight_plan") if isinstance(result.get("bin_weight_plan"), dict) else {})
     diagnostics = bin_plan.get("diagnostics") if isinstance(bin_plan.get("diagnostics"), dict) else {}
     top_bins = _format_top_bins(bin_plan=bin_plan, limit=5)
 
     ev_best = best.get("ev_15m_usd", chosen.get("ev_15m_usd", chosen.get("score")))
     ev_hold = hold.get("ev_15m_usd")
     ev_delta = result.get("ev_delta_usd")
+    hold_components = hold.get("ev_components") if isinstance(hold.get("ev_components"), dict) else {}
 
     return (
         "RUN_ONCE_EV "
         f"ts={result.get('timestamp')} "
         f"h={result.get('horizon')} "
         f"pool={pool.get('name')}[{str(pool.get('address') or '')[:8]}]@{_fmt_num(pool.get('current_price'), 4)} "
+        f"spot={_fmt_num(pool.get('current_price'), 4)} "
+        f"active_range=[{_fmt_num(active_position.get('lower_price'), 4)},{_fmt_num(active_position.get('upper_price'), 4)}] "
         f"range=[{_fmt_num(chosen.get('lower_bound'), 4)},{_fmt_num(chosen.get('upper_bound'), 4)}] "
         f"w={_fmt_num(chosen.get('width_pct'), 2)}% "
         f"EV15m={_fmt_num(ev_best, 4)} "
         f"hold={_fmt_num(ev_hold, 4)} "
         f"delta={_fmt_num(ev_delta, 4)} "
+        f"action={result.get('selected_action')} "
         f"fees={_fmt_num(best_components.get('expected_fees_usd'), 4)} "
         f"il={_fmt_num(best_components.get('expected_il_usd'), 4)} "
+        f"il_base={_fmt_num(best_components.get('il_baseline_usd'), 4)} "
+        f"il_pen={_fmt_num(best_components.get('il_state_penalty_usd'), 4)} "
+        f"il_mult={_fmt_num(best_components.get('il_multiplier'), 3)} "
+        f"drift_bps={_fmt_num(best_components.get('p50_drift_bps'), 1)} "
+        f"oor_p={_fmt_num(best_components.get('out_of_range_prob_15m'), 3)} "
+        f"one_side={_fmt_num(best_components.get('one_sided_break_prob'), 3)} "
         f"cost={_fmt_num(best_components.get('rebalance_cost_usd'), 4)}+{_fmt_num(best_components.get('pool_switch_extra_cost_usd'), 4)} "
-        f"occ={_fmt_num(best_components.get('active_occupancy_15m'), 3)} "
+        f"occ_range={_fmt_num(best_components.get('range_active_occupancy_15m', best_components.get('active_occupancy_15m')), 3)} "
+        f"align={_fmt_num(best_components.get('weight_alignment_score'), 3)} "
+        f"util={_fmt_num(best_components.get('utilization_ratio'), 3)} "
+        f"util_hold={_fmt_num(hold_components.get('utilization_ratio'), 3)} "
+        f"hold_out_bps={_fmt_num(hold_components.get('out_of_range_bps'), 2)} "
+        f"hold_oor_cycles={hold_components.get('out_of_range_cycles')} "
+        f"hold_exact_bounds={str(str(hold_components.get('baseline_mode') or '').startswith('current_hold_exact_bounds')).lower()} "
+        f"capture={_fmt_num(best_components.get('fee_capture_factor'), 3)} "
         f"conc={_fmt_num(best_components.get('concentration_factor'), 3)} "
         f"fee_rate15m={_fmt_num(best_components.get('fee_rate_15m_fraction'), 6)} "
+        f"cost_model={cost_model.get('source')}:{cost_model.get('applied_total_fee_lamports')} "
+        f"weight_obj={execution_config.get('synth_weight_objective')} "
+        f"score_obj={result.get('scoring_objective_used')} "
+        f"rescored={result.get('rescored_candidate_count')} "
         f"bins={diagnostics.get('num_bins', '?')} "
         f"path={diagnostics.get('used_prediction_percentiles', False)} "
         f"fallback={diagnostics.get('fallback_reason')} "
         f"mass={_fmt_num(diagnostics.get('mass_in_range'), 4)} "
+        f"top1={_fmt_num(result.get('top1_weight_share'), 3)} "
+        f"top3={_fmt_num(result.get('top3_weight_share'), 3)} "
         f"switch={best.get('pool_switch')} "
-        f"gate=ev:{gate.get('ev_threshold_passed')} structural:{gate.get('structural_change_passed')} "
-        f"rebalance={rebalance.get('should_rebalance')}({rebalance.get('reason')}) "
+        f"gate={gate.get('gate_mode')} ev:{gate.get('ev_threshold_passed')} structural:{gate.get('structural_change_passed')} "
+        f"protective_breach={gate.get('protective_breach_count')} "
+        f"rebalance={rebalance.get('should_rebalance')} close_idle={rebalance.get('should_close_to_idle')}({rebalance.get('reason')}) "
         f"top_bins={top_bins}"
     )
 

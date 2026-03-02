@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import unittest
 
 from ai_liquidity_optimizer.models import (
@@ -9,7 +11,10 @@ from ai_liquidity_optimizer.models import (
     SynthPredictionPercentilesSnapshot,
     WeightedBinPlan,
 )
-from ai_liquidity_optimizer.orchestrator import _should_rebalance_ev
+from ai_liquidity_optimizer.orchestrator import (
+    _lamports_to_usd,
+    _should_rebalance_ev,
+)
 from ai_liquidity_optimizer.strategy.ev import EvLpScorer
 
 
@@ -214,14 +219,297 @@ class EvLpScorerTests(unittest.TestCase):
                 {0.0: 90.0, 100.0: 100.0},   # t=25 lower bin (should be ignored)
             ],
         )
-        occ, source = scorer.active_occupancy_15m(
+        occ, align, source = scorer.active_occupancy_15m(
             forecast=forecast,
             synth_horizon="1h",
             weighted_bin_plan=plan,
             prediction_percentiles=percentiles,
         )
-        self.assertEqual(source, "prediction_percentiles_weighted")
+        self.assertEqual(source, "prediction_percentiles_range_occupancy")
         self.assertGreater(occ, 0.8)
+        self.assertIsNotNone(align)
+
+    def test_ev_components_expose_range_occupancy_and_alignment(self):
+        scorer = EvLpScorer(ev_horizon_minutes=15, ev_percentile_decay_half_life_minutes=15, rebalance_cost_usd=0.0)
+        pool = _pool(address="A", tvl=1_000_000, fee_1h=0.02, fee_24h=0.08)
+        forecast = _forecast(lower=90, upper=110, il=0.0, t_in=60.0)
+        plan = _weighted_plan(lower=90, upper=110, weights=[0.01, 0.99])
+        percentiles = SynthPredictionPercentilesSnapshot(
+            asset="SOL",
+            current_price=100.0,
+            step_minutes=5,
+            percentiles_by_step=[
+                {0.0: 90.0, 100.0: 110.0},
+                {0.0: 90.0, 100.0: 110.0},
+                {0.0: 90.0, 100.0: 110.0},
+                {0.0: 90.0, 100.0: 110.0},
+            ],
+        )
+        scored = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=forecast,
+            weighted_bin_plan=plan,
+            synth_horizon="1h",
+            prediction_percentiles=percentiles,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=forecast.width_pct,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+        )
+        self.assertGreater(scored.ev_components.range_active_occupancy_15m or 0.0, 0.9)
+        self.assertIsNotNone(scored.ev_components.weight_alignment_score)
+        self.assertLess(scored.ev_components.weight_alignment_score or 0.0, scored.ev_components.active_occupancy_15m)
+        self.assertIsNotNone(scored.ev_components.utilization_ratio)
+        self.assertIsNotNone(scored.ev_components.fee_capture_factor)
+        self.assertIsNotNone(scored.ev_components.il_baseline_usd)
+        self.assertIsNotNone(scored.ev_components.il_state_penalty_usd)
+        self.assertIsNotNone(scored.ev_components.out_of_range_bps)
+        self.assertIsNotNone(scored.ev_components.out_of_range_cycles)
+        self.assertIsNotNone(scored.ev_components.out_of_range_penalty_fraction_15m)
+
+    def test_fee_capture_factor_reduces_fees_when_utilization_low(self):
+        scorer = EvLpScorer(
+            ev_horizon_minutes=15,
+            ev_percentile_decay_half_life_minutes=15,
+            rebalance_cost_usd=0.0,
+            ev_capture_kappa=0.7,
+            ev_capture_min=0.6,
+            ev_capture_max=1.05,
+        )
+        pool = _pool(address="A", tvl=1_000_000, fee_1h=0.02, fee_24h=0.08)
+        forecast = _forecast(lower=90, upper=110, il=0.0, t_in=60.0)
+        percentiles = SynthPredictionPercentilesSnapshot(
+            asset="SOL",
+            current_price=100.0,
+            step_minutes=5,
+            percentiles_by_step=[
+                {0.0: 100.0, 100.0: 110.0},
+                {0.0: 100.0, 100.0: 110.0},
+                {0.0: 100.0, 100.0: 110.0},
+                {0.0: 100.0, 100.0: 110.0},
+            ],
+        )
+        matched = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=forecast,
+            weighted_bin_plan=_weighted_plan(lower=90, upper=110, weights=[0.01, 0.99]),
+            synth_horizon="1h",
+            prediction_percentiles=percentiles,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=forecast.width_pct,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+        )
+        mismatched = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=forecast,
+            weighted_bin_plan=_weighted_plan(lower=90, upper=110, weights=[0.99, 0.01]),
+            synth_horizon="1h",
+            prediction_percentiles=percentiles,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=forecast.width_pct,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+        )
+        self.assertGreater(
+            matched.ev_components.fee_capture_factor or 0.0,
+            mismatched.ev_components.fee_capture_factor or 0.0,
+        )
+        self.assertGreater(matched.ev_components.expected_fees_usd, mismatched.ev_components.expected_fees_usd)
+
+    def test_hold_state_penalty_is_zero_when_in_range(self):
+        scorer = EvLpScorer(
+            ev_oor_penalty_enabled=True,
+            ev_oor_penalize_hold_only=True,
+            ev_oor_deadband_bps=5.0,
+            ev_oor_ref_bps=50.0,
+            ev_oor_base_penalty_fraction_15m=0.00025,
+            ev_oor_max_penalty_fraction_15m=0.0015,
+            ev_oor_persistence_step=0.2,
+            ev_oor_persistence_cap_cycles=12,
+            rebalance_cost_usd=0.0,
+        )
+        pool = _pool(address="A", tvl=1_000_000, current_price=100.0, fee_1h=0.02, fee_24h=0.08)
+        scored = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=_forecast(lower=95.0, upper=105.0, il=0.001),
+            weighted_bin_plan=_weighted_plan(lower=95.0, upper=105.0),
+            synth_horizon="1h",
+            prediction_percentiles=None,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=10.0,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+            baseline_mode="current_hold_exact_bounds",
+            out_of_range_cycles=5,
+        )
+        self.assertGreaterEqual(scored.ev_components.il_state_penalty_usd or 0.0, 0.0)
+        self.assertAlmostEqual(scored.ev_components.out_of_range_penalty_fraction_15m or 0.0, 0.0, places=12)
+
+    def test_hold_state_penalty_increases_with_distance_and_cycles(self):
+        scorer = EvLpScorer(
+            ev_oor_penalty_enabled=True,
+            ev_oor_penalize_hold_only=True,
+            ev_oor_deadband_bps=5.0,
+            ev_oor_ref_bps=50.0,
+            ev_oor_base_penalty_fraction_15m=0.00025,
+            ev_oor_max_penalty_fraction_15m=0.0015,
+            ev_oor_persistence_step=0.2,
+            ev_oor_persistence_cap_cycles=12,
+            rebalance_cost_usd=0.0,
+        )
+        pool = _pool(address="A", tvl=1_000_000, current_price=101.0, fee_1h=0.02, fee_24h=0.08)
+        forecast = _forecast(lower=95.0, upper=100.0, il=0.001)
+        plan = _weighted_plan(lower=95.0, upper=100.0)
+        scored_low_cycles = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=forecast,
+            weighted_bin_plan=plan,
+            synth_horizon="1h",
+            prediction_percentiles=None,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=10.0,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+            baseline_mode="current_hold_exact_bounds",
+            out_of_range_cycles=1,
+        )
+        scored_high_cycles = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=forecast,
+            weighted_bin_plan=plan,
+            synth_horizon="1h",
+            prediction_percentiles=None,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=10.0,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+            baseline_mode="current_hold_exact_bounds",
+            out_of_range_cycles=8,
+        )
+        self.assertGreater(scored_low_cycles.ev_components.out_of_range_bps or 0.0, 0.0)
+        self.assertGreater(
+            scored_high_cycles.ev_components.il_state_penalty_usd or 0.0,
+            scored_low_cycles.ev_components.il_state_penalty_usd or 0.0,
+        )
+        self.assertGreater(
+            scored_high_cycles.ev_components.out_of_range_penalty_fraction_15m or 0.0,
+            scored_low_cycles.ev_components.out_of_range_penalty_fraction_15m or 0.0,
+        )
+
+    def test_oor_penalty_applies_only_to_hold_when_configured(self):
+        scorer = EvLpScorer(
+            ev_oor_penalty_enabled=True,
+            ev_oor_penalize_hold_only=True,
+            ev_oor_deadband_bps=5.0,
+            ev_oor_ref_bps=50.0,
+            ev_oor_base_penalty_fraction_15m=0.00025,
+            ev_oor_max_penalty_fraction_15m=0.0015,
+            ev_oor_persistence_step=0.2,
+            ev_oor_persistence_cap_cycles=12,
+            rebalance_cost_usd=0.0,
+        )
+        pool = _pool(address="A", tvl=1_000_000, current_price=110.0, fee_1h=0.02, fee_24h=0.08)
+        forecast = _forecast(lower=95.0, upper=100.0, il=0.001)
+        plan = _weighted_plan(lower=95.0, upper=100.0)
+        hold = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=forecast,
+            weighted_bin_plan=plan,
+            synth_horizon="1h",
+            prediction_percentiles=None,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=10.0,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+            baseline_mode="current_hold_exact_bounds",
+            out_of_range_cycles=5,
+        )
+        candidate = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=forecast,
+            weighted_bin_plan=plan,
+            synth_horizon="1h",
+            prediction_percentiles=None,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=10.0,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+            baseline_mode="candidate",
+            out_of_range_cycles=5,
+        )
+        self.assertGreater(hold.ev_components.out_of_range_penalty_fraction_15m or 0.0, 0.0)
+        self.assertAlmostEqual(candidate.ev_components.out_of_range_penalty_fraction_15m or 0.0, 0.0, places=12)
+
+    def test_il_multiplier_increases_under_directional_drift_risk(self):
+        scorer = EvLpScorer(
+            ev_il_drift_alpha=0.7,
+            ev_il_oor_beta=1.2,
+            ev_il_onesided_gamma=0.8,
+            ev_il_persistence_delta=0.0,
+            ev_il_mult_min=1.0,
+            ev_il_mult_max=3.0,
+            ev_il_drift_ref_bps=50.0,
+            ev_oor_penalty_enabled=False,
+            rebalance_cost_usd=0.0,
+        )
+        pool = _pool(address="A", tvl=1_000_000, current_price=100.0, fee_1h=0.02, fee_24h=0.08)
+        forecast = _forecast(lower=99.0, upper=101.0, il=0.001)
+        plan = _weighted_plan(lower=99.0, upper=101.0, weights=[0.5, 0.5])
+        prediction = SynthPredictionPercentilesSnapshot(
+            asset="SOL",
+            current_price=100.0,
+            step_minutes=5,
+            percentiles_by_step=[
+                {0.0: 104.0, 50.0: 108.0, 100.0: 112.0},
+                {0.0: 105.0, 50.0: 109.0, 100.0: 113.0},
+                {0.0: 106.0, 50.0: 110.0, 100.0: 114.0},
+                {0.0: 107.0, 50.0: 111.0, 100.0: 115.0},
+            ],
+        )
+        scored = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=forecast,
+            weighted_bin_plan=plan,
+            synth_horizon="1h",
+            prediction_percentiles=prediction,
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=forecast.width_pct,
+            bin_step_ref_bps=10.0,
+            active_position=None,
+            range_change_threshold_bps=25.0,
+            apply_rebalance_costs=False,
+            baseline_mode="candidate",
+            out_of_range_cycles=0,
+        )
+        self.assertGreater(scored.ev_components.il_multiplier or 0.0, 1.0)
+        self.assertGreater(scored.ev_components.out_of_range_prob_15m or 0.0, 0.5)
+        self.assertGreater(scored.ev_components.expected_il_usd, scored.ev_components.il_baseline_usd or 0.0)
 
     def test_ev_gate_blocks_small_delta(self):
         scorer = EvLpScorer()
@@ -241,7 +529,7 @@ class EvLpScorerTests(unittest.TestCase):
             apply_rebalance_costs=True,
         )
         state = BotState(active_position=ActivePositionState(pool_address="A", lower_price=90, upper_price=110, width_pct=20, executor="dry-run"))
-        should_rebalance, reason, gate = _should_rebalance_ev(
+        should_rebalance, reason, gate, _breach = _should_rebalance_ev(
             state=state,
             best=candidate,
             ev_delta_usd=0.10,
@@ -270,7 +558,7 @@ class EvLpScorerTests(unittest.TestCase):
             apply_rebalance_costs=True,
         )
         state = BotState(active_position=active)
-        should_rebalance, _reason, gate = _should_rebalance_ev(
+        should_rebalance, _reason, gate, _breach = _should_rebalance_ev(
             state=state,
             best=candidate,
             ev_delta_usd=10.0,
@@ -278,6 +566,99 @@ class EvLpScorerTests(unittest.TestCase):
         )
         self.assertFalse(should_rebalance)
         self.assertFalse(bool(gate.get("structural_change_passed")))
+
+    def test_protective_gate_triggers_after_hysteresis(self):
+        scorer = EvLpScorer()
+        pool = _pool(address="A", tvl=1_000_000, fee_1h=0.02, fee_24h=0.08)
+        active = ActivePositionState(pool_address="A", lower_price=95, upper_price=105, width_pct=10, executor="dry-run")
+        candidate = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=_forecast(lower=94.0, upper=106.0),
+            weighted_bin_plan=_weighted_plan(lower=94.0, upper=106.0, weights=[0.01, 0.99]),
+            synth_horizon="1h",
+            prediction_percentiles=SynthPredictionPercentilesSnapshot(
+                asset="SOL",
+                current_price=100.0,
+                step_minutes=5,
+                percentiles_by_step=[
+                    {0.0: 90.0, 100.0: 110.0},
+                    {0.0: 90.0, 100.0: 110.0},
+                    {0.0: 90.0, 100.0: 110.0},
+                    {0.0: 90.0, 100.0: 110.0},
+                ],
+            ),
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=10.0,
+            bin_step_ref_bps=10.0,
+            active_position=active,
+            range_change_threshold_bps=1.0,
+            apply_rebalance_costs=True,
+        )
+        hold = scorer.score_pool_range_ev_15m(
+            pool=pool,
+            forecast=_forecast(lower=95.0, upper=105.0),
+            weighted_bin_plan=_weighted_plan(lower=95.0, upper=105.0, weights=[0.99, 0.01]),
+            synth_horizon="1h",
+            prediction_percentiles=SynthPredictionPercentilesSnapshot(
+                asset="SOL",
+                current_price=100.0,
+                step_minutes=5,
+                percentiles_by_step=[
+                    {0.0: 90.0, 100.0: 110.0},
+                    {0.0: 90.0, 100.0: 110.0},
+                    {0.0: 90.0, 100.0: 110.0},
+                    {0.0: 90.0, 100.0: 110.0},
+                ],
+            ),
+            deposit_sol_amount=1.0,
+            deposit_usdc_amount=100.0,
+            width_ref_pct=10.0,
+            bin_step_ref_bps=10.0,
+            active_position=active,
+            range_change_threshold_bps=1.0,
+            apply_rebalance_costs=False,
+            baseline_mode="current_hold",
+        )
+        # Force known utilization for deterministic gate behavior.
+        candidate.ev_components.utilization_ratio = 0.62
+        hold.ev_components.utilization_ratio = 0.20
+        state = BotState(active_position=active)
+
+        should_rebalance, reason, gate, breach = _should_rebalance_ev(
+            state=state,
+            best=candidate,
+            ev_current_hold=hold,
+            ev_delta_usd=-0.001,
+            min_ev_improvement_usd=0.01,
+            prior_protective_breach_count=0,
+            ev_utilization_floor=0.40,
+            ev_min_utilization_gain=0.15,
+            ev_max_protective_ev_slip_usd=0.002,
+            ev_protective_breach_cycles=2,
+        )
+        self.assertFalse(should_rebalance)
+        self.assertEqual(breach, 1)
+        self.assertEqual(gate.get("gate_mode"), "protective_utilization")
+        self.assertTrue(str(reason).startswith("protective_wait_"))
+
+        should_rebalance, reason, gate, breach = _should_rebalance_ev(
+            state=state,
+            best=candidate,
+            ev_current_hold=hold,
+            ev_delta_usd=-0.001,
+            min_ev_improvement_usd=0.01,
+            prior_protective_breach_count=breach,
+            ev_utilization_floor=0.40,
+            ev_min_utilization_gain=0.15,
+            ev_max_protective_ev_slip_usd=0.002,
+            ev_protective_breach_cycles=2,
+        )
+        self.assertTrue(should_rebalance)
+        self.assertEqual(reason, "protective_utilization_rebalance")
+
+    def test_lamports_to_usd_helper(self):
+        self.assertAlmostEqual(_lamports_to_usd(15_000, 88.0), 0.00132, places=8)
 
 
 if __name__ == "__main__":

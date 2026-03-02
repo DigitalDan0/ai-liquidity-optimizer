@@ -260,8 +260,23 @@ class EvComponentBreakdown:
     fee_rate_15m_fraction: float
     capital_usd: float
     il_15m_fraction: float
+    range_active_occupancy_15m: float | None = None
+    weight_alignment_score: float | None = None
+    utilization_ratio: float | None = None
+    fee_capture_factor: float | None = None
     occupancy_source: str | None = None
     baseline_mode: str | None = None
+    il_baseline_usd: float | None = None
+    il_state_penalty_usd: float | None = None
+    out_of_range_bps: float | None = None
+    out_of_range_cycles: int | None = None
+    out_of_range_penalty_fraction_15m: float | None = None
+    il_multiplier: float | None = None
+    p50_drift_bps: float | None = None
+    out_of_range_prob_15m: float | None = None
+    one_sided_break_prob: float | None = None
+    directional_confidence: float | None = None
+    expected_out_of_range_minutes_15m: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -281,6 +296,7 @@ class EvScoredCandidate:
     rebalance_structural_change: bool = True
     pool_switch: bool = False
     range_change_bps_vs_active: float | None = None
+    action_type: str = "rebalance"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -303,6 +319,7 @@ class EvScoredCandidate:
             "rebalance_structural_change": self.rebalance_structural_change,
             "pool_switch": self.pool_switch,
             "range_change_bps_vs_active": self.range_change_bps_vs_active,
+            "action_type": self.action_type,
         }
 
 
@@ -341,15 +358,45 @@ class ActivePositionState:
 
 
 @dataclass(slots=True)
+class ExecutorRangeBinQuote:
+    pool_address: str
+    active_bin_id: int | None
+    sdk_price_orientation: str | None
+    pool_price_orientation: str | None
+    lower_for_sdk: float | None
+    upper_for_sdk: float | None
+    bin_ids: list[int]
+    bin_prices_sol_usdc: list[float]
+    bin_prices_sdk: list[float] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pool_address": self.pool_address,
+            "active_bin_id": self.active_bin_id,
+            "sdk_price_orientation": self.sdk_price_orientation,
+            "pool_price_orientation": self.pool_price_orientation,
+            "lower_for_sdk": self.lower_for_sdk,
+            "upper_for_sdk": self.upper_for_sdk,
+            "bin_ids": self.bin_ids,
+            "bin_prices_sol_usdc": self.bin_prices_sol_usdc,
+            "bin_prices_sdk": self.bin_prices_sdk,
+            "raw": self.raw,
+        }
+
+
+@dataclass(slots=True)
 class BotState:
     active_position: ActivePositionState | None = None
     last_decision: dict[str, Any] | None = None
+    strategy_state: dict[str, Any] = field(default_factory=dict)
     updated_at: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "active_position": self.active_position.to_dict() if self.active_position else None,
             "last_decision": self.last_decision,
+            "strategy_state": self.strategy_state,
             "updated_at": self.updated_at,
         }
 
@@ -363,6 +410,7 @@ class ExecutionApplyRequest:
     deposit_sol_amount: float
     deposit_usdc_amount: float
     existing_position: ActivePositionState | None
+    target_bin_ids: list[int] | None = None
     target_bin_edges: list[float] | None = None
     target_bin_weights: list[float] | None = None
 

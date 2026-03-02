@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import time
 from typing import Any
 from urllib import error, parse, request
@@ -41,7 +42,7 @@ class JsonHttpClient:
                 with request.urlopen(req, timeout=self.timeout_seconds) as resp:
                     body = resp.read().decode("utf-8")
                     return json.loads(body)
-            except (error.HTTPError, error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except (error.HTTPError, error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
                 last_error = exc
                 if attempt >= self.max_retries:
                     break

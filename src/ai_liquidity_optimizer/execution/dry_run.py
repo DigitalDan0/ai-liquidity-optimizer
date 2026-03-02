@@ -5,6 +5,14 @@ from ai_liquidity_optimizer.models import ActivePositionState, ExecutionApplyReq
 
 
 class DryRunExecutor(PositionExecutor):
+    def close_position(self, active_position: ActivePositionState | None) -> ExecutionApplyResult:
+        return ExecutionApplyResult(
+            changed=active_position is not None,
+            active_position=None,
+            tx_signatures=[],
+            details={"mode": "dry-run", "message": "Simulated close to idle"},
+        )
+
     def apply_target_range(self, request: ExecutionApplyRequest) -> ExecutionApplyResult:
         existing = request.existing_position
         simulated_pubkey = existing.position_pubkey if existing and existing.position_pubkey else "SIMULATED_POSITION"
@@ -30,4 +38,3 @@ class DryRunExecutor(PositionExecutor):
             tx_signatures=[],
             details={"mode": "dry-run", "message": "No on-chain transactions submitted"},
         )
-
