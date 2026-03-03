@@ -10,6 +10,26 @@ import {
   sendAndConfirmTransaction
 } from "@solana/web3.js";
 
+const RPC_FETCH_MAX_ATTEMPTS = parseEnvInt("RPC_FETCH_MAX_ATTEMPTS", 12, 1, 50);
+const RPC_FETCH_BASE_DELAY_MS = parseEnvInt("RPC_FETCH_BASE_DELAY_MS", 500, 50, 30000);
+const RPC_FETCH_MAX_DELAY_MS = parseEnvInt("RPC_FETCH_MAX_DELAY_MS", 15000, 100, 120000);
+const RPC_OPERATION_MAX_ATTEMPTS = parseEnvInt("RPC_OPERATION_MAX_ATTEMPTS", 5, 1, 20);
+const RPC_OPERATION_BASE_DELAY_MS = parseEnvInt("RPC_OPERATION_BASE_DELAY_MS", 600, 50, 30000);
+const RPC_OPERATION_MAX_DELAY_MS = parseEnvInt("RPC_OPERATION_MAX_DELAY_MS", 10000, 100, 120000);
+
+function createRpcConnection(rpcUrl) {
+  const retryingFetch = makeRpcRetryingFetch({
+    maxAttempts: RPC_FETCH_MAX_ATTEMPTS,
+    baseDelayMs: RPC_FETCH_BASE_DELAY_MS,
+    maxDelayMs: RPC_FETCH_MAX_DELAY_MS
+  });
+  return new Connection(rpcUrl, {
+    commitment: "confirmed",
+    disableRetryOnRateLimit: true,
+    fetch: retryingFetch
+  });
+}
+
 async function main() {
   const input = await readStdinJson();
   if (!input || !input.command) {
@@ -25,6 +45,10 @@ async function main() {
   }
   if (input.command === "close-position") {
     await handleClosePosition(input);
+    return;
+  }
+  if (input.command === "wallet-snapshot") {
+    await handleWalletSnapshot(input);
     return;
   }
   if (input.command !== "apply-range") {
@@ -44,7 +68,7 @@ async function main() {
   const synthWeightActiveBinFloorBps = clampInt(Number(input.synth_weight_active_bin_floor_bps ?? 1000), 0, 10000);
   const synthWeightMaxBinBpsPerSide = clampInt(Number(input.synth_weight_max_bin_bps_per_side ?? 7000), 0, 10000);
 
-  const connection = new Connection(rpc_url, "confirmed");
+  const connection = createRpcConnection(rpc_url);
   const secret = bs58.decode(private_key_b58);
   const wallet = Keypair.fromSecretKey(Uint8Array.from(secret));
   const dlmmPool = await DLMM.create(connection, new PublicKey(pool.address));
@@ -82,73 +106,90 @@ async function main() {
   }
 
   const newPosition = Keypair.generate();
-  let createTx;
-  let executionMeta;
-  if (liquidityMode === "synth_weights") {
-    const activeBinId = extractBinId(activeBin);
-    if (bins.length > maxCustomWeightPositionBins) {
-      throw new Error(
-        `Custom-weight position spans ${bins.length} bins, exceeding MAX_CUSTOM_WEIGHT_POSITION_BINS=${maxCustomWeightPositionBins}`
-      );
-    }
-    const synthWeights = Array.isArray(input.target_bin_weights) ? input.target_bin_weights : null;
-    const synthBinEdges = Array.isArray(input.target_bin_edges) ? input.target_bin_edges : null;
-    const distributionBuild = buildXYAmountDistributionFromSynth({
-      bins,
-      targetBinIds: Array.isArray(input.target_bin_ids) ? input.target_bin_ids : null,
-      targetBinWeights: synthWeights,
-      targetBinEdges: synthBinEdges,
-      pool,
-      sdkPriceOrientation,
-      lowerForSdk,
-      upperForSdk,
-      activeBinId,
-      activeBinFloorBps: synthWeightActiveBinFloorBps,
-      maxBinBpsPerSide: synthWeightMaxBinBpsPerSide,
-      totalXAmount,
-      totalYAmount
-    });
-    createTx = await dlmmPool.initializePositionAndAddLiquidityByWeight({
-      positionPubKey: newPosition.publicKey,
-      user: wallet.publicKey,
-      totalXAmount,
-      totalYAmount,
-      xYAmountDistribution: distributionBuild.xYAmountDistribution
-    });
-    executionMeta = {
-      liquidity_mode: "synth_weights",
-      sdk_method_used: "initializePositionAndAddLiquidityByWeight",
-      custom_weight_num_bins: bins.length,
-      active_bin_id: activeBinId,
-      sdk_tx_count: Array.isArray(createTx) ? createTx.length : 1,
-      custom_weight_validation: distributionBuild.validation,
-      custom_weight_distribution_preview: distributionBuild.preview
-    };
-  } else if (liquidityMode === "spot") {
-    const strategyParams = buildStrategyParams({
-      lowerBinId,
-      upperBinId,
-      totalXAmount,
-      totalYAmount
-    });
-    createTx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
-      positionPubKey: newPosition.publicKey,
-      user: wallet.publicKey,
-      totalXAmount,
-      totalYAmount,
-      strategy: strategyParams
-    });
-    executionMeta = {
-      liquidity_mode: "spot",
-      sdk_method_used: "initializePositionAndAddLiquidityByStrategy",
-      sdk_tx_count: Array.isArray(createTx) ? createTx.length : 1
-    };
-  } else {
-    throw new Error(`Unsupported liquidity_mode: ${liquidityMode}`);
-  }
-  txSignatures.push(
-    ...(await sendAllTransactions(connection, createTx, [wallet, newPosition]))
+  const createBuild = await withRpcOperationRetries(
+    async () => {
+      if (liquidityMode === "synth_weights") {
+        const activeBinId = extractBinId(activeBin);
+        if (bins.length > maxCustomWeightPositionBins) {
+          throw new Error(
+            `Custom-weight position spans ${bins.length} bins, exceeding MAX_CUSTOM_WEIGHT_POSITION_BINS=${maxCustomWeightPositionBins}`
+          );
+        }
+        const synthWeights = Array.isArray(input.target_bin_weights) ? input.target_bin_weights : null;
+        const synthBinEdges = Array.isArray(input.target_bin_edges) ? input.target_bin_edges : null;
+        const distributionBuild = buildXYAmountDistributionFromSynth({
+          bins,
+          targetBinIds: Array.isArray(input.target_bin_ids) ? input.target_bin_ids : null,
+          targetBinWeights: synthWeights,
+          targetBinEdges: synthBinEdges,
+          pool,
+          sdkPriceOrientation,
+          lowerForSdk,
+          upperForSdk,
+          activeBinId,
+          activeBinFloorBps: synthWeightActiveBinFloorBps,
+          maxBinBpsPerSide: synthWeightMaxBinBpsPerSide,
+          totalXAmount,
+          totalYAmount
+        });
+        const createTx = await dlmmPool.initializePositionAndAddLiquidityByWeight({
+          positionPubKey: newPosition.publicKey,
+          user: wallet.publicKey,
+          totalXAmount,
+          totalYAmount,
+          xYAmountDistribution: distributionBuild.xYAmountDistribution
+        });
+        return {
+          createTx,
+          executionMeta: {
+            liquidity_mode: "synth_weights",
+            sdk_method_used: "initializePositionAndAddLiquidityByWeight",
+            custom_weight_num_bins: bins.length,
+            active_bin_id: activeBinId,
+            sdk_tx_count: Array.isArray(createTx) ? createTx.length : 1,
+            custom_weight_validation: distributionBuild.validation,
+            custom_weight_distribution_preview: distributionBuild.preview
+          }
+        };
+      }
+      if (liquidityMode === "spot") {
+        const strategyParams = buildStrategyParams({
+          lowerBinId,
+          upperBinId,
+          totalXAmount,
+          totalYAmount
+        });
+        const createTx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
+          positionPubKey: newPosition.publicKey,
+          user: wallet.publicKey,
+          totalXAmount,
+          totalYAmount,
+          strategy: strategyParams
+        });
+        return {
+          createTx,
+          executionMeta: {
+            liquidity_mode: "spot",
+            sdk_method_used: "initializePositionAndAddLiquidityByStrategy",
+            sdk_tx_count: Array.isArray(createTx) ? createTx.length : 1
+          }
+        };
+      }
+      throw new Error(`Unsupported liquidity_mode: ${liquidityMode}`);
+    },
+    { label: `build-open-${liquidityMode}` }
   );
+  const createTx = createBuild.value.createTx;
+  const executionMeta = {
+    ...createBuild.value.executionMeta,
+    rpc_create_attempts: createBuild.attempts
+  };
+  const openSend = await withRpcOperationRetries(
+    async () => sendAllTransactions(connection, createTx, [wallet, newPosition]),
+    { label: "send-open-transactions" }
+  );
+  txSignatures.push(...openSend.value);
+  executionMeta.rpc_send_attempts = openSend.attempts;
 
   const widthPct = Number(
     ((target_range_sol_usdc.upper - target_range_sol_usdc.lower) /
@@ -184,7 +225,7 @@ async function handleCheckPosition(input) {
   if (!rpc_url) throw new Error("rpc_url is required");
   if (!position_pubkey) throw new Error("position_pubkey is required");
 
-  const connection = new Connection(rpc_url, "confirmed");
+  const connection = createRpcConnection(rpc_url);
   const info = await connection.getAccountInfo(new PublicKey(position_pubkey), "confirmed");
   writeJson({
     ok: true,
@@ -204,7 +245,7 @@ async function handleClosePosition(input) {
     throw new Error("existing_position.lower_bin_id and existing_position.upper_bin_id are required");
   }
 
-  const connection = new Connection(rpc_url, "confirmed");
+  const connection = createRpcConnection(rpc_url);
   const secret = bs58.decode(private_key_b58);
   const wallet = Keypair.fromSecretKey(Uint8Array.from(secret));
   const dlmmPool = await DLMM.create(connection, new PublicKey(existing_position.pool_address));
@@ -230,6 +271,235 @@ async function handleClosePosition(input) {
   });
 }
 
+async function handleWalletSnapshot(input) {
+  const { rpc_url, private_key_b58, pool, active_position } = input;
+  if (!rpc_url || !private_key_b58) throw new Error("rpc_url and private_key_b58 are required");
+
+  const connection = createRpcConnection(rpc_url);
+  const secret = bs58.decode(private_key_b58);
+  const wallet = Keypair.fromSecretKey(Uint8Array.from(secret));
+
+  const walletPubkey = wallet.publicKey;
+  const solLamports = await connection.getBalance(walletPubkey, "confirmed");
+  const nativeSolBalance = Number(solLamports) / 1e9;
+
+  const resolvedPoolAddress = pool?.address || active_position?.pool_address || null;
+  let dlmmPool = null;
+  if (resolvedPoolAddress) {
+    dlmmPool = await DLMM.create(connection, new PublicKey(resolvedPoolAddress));
+  }
+
+  const symbolX = String(pool?.symbol_x || "").toUpperCase();
+  const symbolY = String(pool?.symbol_y || "").toUpperCase();
+  const mintX = pool?.mint_x || publicKeyLikeToString(dlmmPool?.tokenX?.mint);
+  const mintY = pool?.mint_y || publicKeyLikeToString(dlmmPool?.tokenY?.mint);
+  const decimalsX = Number.isFinite(Number(pool?.decimals_x))
+    ? Number(pool.decimals_x)
+    : Number(numberOrNull(dlmmPool?.tokenX?.decimals) ?? 0);
+  const decimalsY = Number.isFinite(Number(pool?.decimals_y))
+    ? Number(pool.decimals_y)
+    : Number(numberOrNull(dlmmPool?.tokenY?.decimals) ?? 0);
+
+  let spotSolUsdc = null;
+  if (pool?.api_current_price != null && symbolX && symbolY) {
+    spotSolUsdc = poolPriceToSynthSolUsdcPrice(
+      { symbol_x: symbolX, symbol_y: symbolY },
+      numberOrNull(pool.api_current_price)
+    );
+  }
+
+  let tokenX = null;
+  let tokenY = null;
+  if (mintX && mintY) {
+    tokenX = await getTokenUiBalanceByMint(connection, walletPubkey, String(mintX), decimalsX);
+    tokenY = await getTokenUiBalanceByMint(connection, walletPubkey, String(mintY), decimalsY);
+  }
+
+  let walletSolTokenUi = null;
+  let walletUsdcTokenUi = null;
+  if (tokenX && tokenY) {
+    if (symbolX === "SOL" && symbolY === "USDC") {
+      walletSolTokenUi = tokenX.uiAmount;
+      walletUsdcTokenUi = tokenY.uiAmount;
+    } else if (symbolX === "USDC" && symbolY === "SOL") {
+      walletSolTokenUi = tokenY.uiAmount;
+      walletUsdcTokenUi = tokenX.uiAmount;
+    }
+  }
+  const walletSolTotalUi = nativeSolBalance + (walletSolTokenUi || 0);
+  const walletTotalUsdEst =
+    spotSolUsdc != null && walletUsdcTokenUi != null
+      ? walletUsdcTokenUi + walletSolTotalUi * spotSolUsdc
+      : null;
+
+  let positionSnapshot = null;
+  let activePositionExists = null;
+  if (active_position?.position_pubkey) {
+    const info = await connection.getAccountInfo(new PublicKey(active_position.position_pubkey), "confirmed");
+    activePositionExists = Boolean(info);
+    if (info && dlmmPool) {
+      try {
+        const pos = await dlmmPool.getPosition(new PublicKey(active_position.position_pubkey));
+        const data = pos?.positionData || null;
+        const totalXRaw = bnLikeToBigInt(data?.totalXAmountExcludeTransferFee ?? data?.totalXAmount);
+        const totalYRaw = bnLikeToBigInt(data?.totalYAmountExcludeTransferFee ?? data?.totalYAmount);
+        const feeXRaw = bnLikeToBigInt(data?.feeXExcludeTransferFee ?? data?.feeX);
+        const feeYRaw = bnLikeToBigInt(data?.feeYExcludeTransferFee ?? data?.feeY);
+        const totalXUi = totalXRaw != null ? bigIntToUi(totalXRaw, decimalsX) : null;
+        const totalYUi = totalYRaw != null ? bigIntToUi(totalYRaw, decimalsY) : null;
+        const feeXUi = feeXRaw != null ? bigIntToUi(feeXRaw, decimalsX) : null;
+        const feeYUi = feeYRaw != null ? bigIntToUi(feeYRaw, decimalsY) : null;
+
+        let principalSolUi = null;
+        let principalUsdcUi = null;
+        let feeSolUi = null;
+        let feeUsdcUi = null;
+        if (symbolX === "SOL" && symbolY === "USDC") {
+          principalSolUi = totalXUi;
+          principalUsdcUi = totalYUi;
+          feeSolUi = feeXUi;
+          feeUsdcUi = feeYUi;
+        } else if (symbolX === "USDC" && symbolY === "SOL") {
+          principalSolUi = totalYUi;
+          principalUsdcUi = totalXUi;
+          feeSolUi = feeYUi;
+          feeUsdcUi = feeXUi;
+        }
+        const positionSolUi = (principalSolUi || 0) + (feeSolUi || 0);
+        const positionUsdcUi = (principalUsdcUi || 0) + (feeUsdcUi || 0);
+        const positionTotalUsdEst =
+          spotSolUsdc != null && principalUsdcUi != null
+            ? positionUsdcUi + positionSolUi * spotSolUsdc
+            : null;
+
+        positionSnapshot = {
+          position_pubkey: active_position.position_pubkey,
+          lower_bin_id: data?.lowerBinId ?? active_position.lower_bin_id ?? null,
+          upper_bin_id: data?.upperBinId ?? active_position.upper_bin_id ?? null,
+          total_x_ui: totalXUi,
+          total_y_ui: totalYUi,
+          fee_x_ui: feeXUi,
+          fee_y_ui: feeYUi,
+          principal_sol_ui: principalSolUi,
+          principal_usdc_ui: principalUsdcUi,
+          fee_sol_ui: feeSolUi,
+          fee_usdc_ui: feeUsdcUi,
+          total_sol_ui: positionSolUi,
+          total_usdc_ui: positionUsdcUi,
+          total_usd_est: positionTotalUsdEst
+        };
+      } catch (error) {
+        positionSnapshot = {
+          position_pubkey: active_position.position_pubkey,
+          error: String(error?.message || error)
+        };
+      }
+    }
+  }
+
+  const totalUsdEst =
+    walletTotalUsdEst != null || numberOrNull(positionSnapshot?.total_usd_est) != null
+      ? (walletTotalUsdEst || 0) + (numberOrNull(positionSnapshot?.total_usd_est) || 0)
+      : null;
+
+  const poolBalances = {
+    symbol_x: symbolX || pool?.symbol_x || null,
+    symbol_y: symbolY || pool?.symbol_y || null,
+    mint_x: mintX || null,
+    mint_y: mintY || null,
+    decimals_x: decimalsX,
+    decimals_y: decimalsY,
+    token_x_ui: tokenX?.uiAmount ?? null,
+    token_y_ui: tokenY?.uiAmount ?? null,
+    wallet_native_sol_ui: nativeSolBalance,
+    wallet_sol_token_ui: walletSolTokenUi,
+    wallet_sol_total_ui: walletSolTotalUi,
+    wallet_usdc_ui: walletUsdcTokenUi,
+    wallet_total_usd_est: walletTotalUsdEst,
+    spot_sol_usdc: spotSolUsdc
+  };
+
+  writeJson({
+    ok: true,
+    snapshot_at: new Date().toISOString(),
+    wallet_pubkey: walletPubkey.toBase58(),
+    sol_lamports: solLamports,
+    sol_balance: walletSolTotalUi,
+    usdc_balance: walletUsdcTokenUi,
+    native_sol_balance: nativeSolBalance,
+    wallet_sol_token_balance: walletSolTokenUi,
+    wallet_sol_total_balance: walletSolTotalUi,
+    wallet_usdc_total_balance: walletUsdcTokenUi,
+    wallet_total_usd_est: walletTotalUsdEst,
+    position_total_usd_est: numberOrNull(positionSnapshot?.total_usd_est),
+    position_snapshot: positionSnapshot,
+    spot_price_sol_usdc: spotSolUsdc,
+    total_usd_est: totalUsdEst,
+    pool_balances: poolBalances,
+    active_position_exists: activePositionExists
+  });
+}
+
+async function getTokenUiBalanceByMint(connection, ownerPubkey, mintAddress, decimalsHint) {
+  const mint = new PublicKey(mintAddress);
+  const resp = await connection.getParsedTokenAccountsByOwner(ownerPubkey, { mint }, "confirmed");
+  let totalRaw = 0n;
+  let decimals = Number.isInteger(decimalsHint) && decimalsHint >= 0 ? decimalsHint : 0;
+  for (const row of resp?.value || []) {
+    const tokenAmount = row?.account?.data?.parsed?.info?.tokenAmount;
+    if (!tokenAmount) continue;
+    const raw = tokenAmount.amount;
+    const rowDecimals = Number(tokenAmount.decimals);
+    if (Number.isFinite(rowDecimals) && rowDecimals >= 0) {
+      decimals = rowDecimals;
+    }
+    try {
+      totalRaw += BigInt(raw);
+    } catch {
+      continue;
+    }
+  }
+  return {
+    mint: mintAddress,
+    amountRaw: totalRaw.toString(),
+    decimals,
+    uiAmount: bigIntToUi(totalRaw, decimals)
+  };
+}
+
+function bigIntToUi(amountRaw, decimals) {
+  const d = Math.max(0, Number(decimals) || 0);
+  const scale = 10n ** BigInt(d);
+  const whole = amountRaw / scale;
+  const frac = amountRaw % scale;
+  return Number(whole) + Number(frac) / Number(scale);
+}
+
+function bnLikeToBigInt(value) {
+  if (value == null) return null;
+  try {
+    if (typeof value === "bigint") return value;
+    if (typeof value === "number") return BigInt(Math.trunc(value));
+    if (typeof value === "string") return BigInt(value);
+    if (typeof value.toString === "function") return BigInt(value.toString());
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function publicKeyLikeToString(value) {
+  if (!value) return null;
+  try {
+    if (typeof value === "string") return value;
+    if (typeof value.toBase58 === "function") return value.toBase58();
+    if (typeof value.toString === "function") return value.toString();
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 async function handleQuoteRangeBins(input) {
   const { rpc_url, pool, target_range_sol_usdc } = input;
   if (!rpc_url) throw new Error("rpc_url is required");
@@ -237,7 +507,7 @@ async function handleQuoteRangeBins(input) {
   if (!target_range_sol_usdc?.lower || !target_range_sol_usdc?.upper) {
     throw new Error("target_range_sol_usdc.lower and .upper are required");
   }
-  const connection = new Connection(rpc_url, "confirmed");
+  const connection = createRpcConnection(rpc_url);
   const dlmmPool = await DLMM.create(connection, new PublicKey(pool.address));
   const quote = await quoteRangeBinsForSdk({
     dlmmPool,
@@ -1013,6 +1283,110 @@ async function sendSingleTransaction(connection, tx, signers) {
     });
   }
   throw new Error(`Unsupported transaction type from SDK: ${tx?.constructor?.name || typeof tx}`);
+}
+
+function makeRpcRetryingFetch({ maxAttempts, baseDelayMs, maxDelayMs }) {
+  return async (input, init) => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await fetch(input, init);
+        if (!shouldRetryHttpStatus(response.status) || attempt === maxAttempts) {
+          return response;
+        }
+        const retryAfterMs = parseRetryAfterMs(response.headers?.get?.("retry-after"));
+        const waitMs = retryAfterMs ?? backoffWithJitterMs(attempt, baseDelayMs, maxDelayMs);
+        console.error(
+          `[rpc-fetch-retry] HTTP ${response.status}; attempt=${attempt}/${maxAttempts}; waiting=${waitMs}ms`
+        );
+        await sleep(waitMs);
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableRpcError(error) || attempt === maxAttempts) {
+          throw error;
+        }
+        const waitMs = backoffWithJitterMs(attempt, baseDelayMs, maxDelayMs);
+        console.error(
+          `[rpc-fetch-retry] network error; attempt=${attempt}/${maxAttempts}; waiting=${waitMs}ms; err=${String(error?.message || error)}`
+        );
+        await sleep(waitMs);
+      }
+    }
+    throw lastError || new Error("RPC fetch retries exhausted");
+  };
+}
+
+async function withRpcOperationRetries(fn, { label = "rpc-operation" } = {}) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= RPC_OPERATION_MAX_ATTEMPTS; attempt++) {
+    try {
+      const value = await fn();
+      return { value, attempts: attempt };
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableRpcError(error) || attempt >= RPC_OPERATION_MAX_ATTEMPTS) {
+        throw error;
+      }
+      const waitMs = backoffWithJitterMs(attempt, RPC_OPERATION_BASE_DELAY_MS, RPC_OPERATION_MAX_DELAY_MS);
+      console.error(
+        `[rpc-op-retry] ${label}; attempt=${attempt}/${RPC_OPERATION_MAX_ATTEMPTS}; waiting=${waitMs}ms; err=${String(error?.message || error)}`
+      );
+      await sleep(waitMs);
+    }
+  }
+  throw lastError || new Error(`${label} failed after retries`);
+}
+
+function shouldRetryHttpStatus(statusCode) {
+  return statusCode === 408 || statusCode === 425 || statusCode === 429 || statusCode === 500 || statusCode === 502 || statusCode === 503 || statusCode === 504;
+}
+
+function parseRetryAfterMs(raw) {
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1000);
+  }
+  const parsedDate = Date.parse(raw);
+  if (!Number.isFinite(parsedDate)) return null;
+  const delta = parsedDate - Date.now();
+  return delta > 0 ? delta : 0;
+}
+
+function isRetryableRpcError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("429") ||
+    message.includes("too many requests") ||
+    message.includes("rate limit") ||
+    message.includes("timed out") ||
+    message.includes("timeout") ||
+    message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("eai_again") ||
+    message.includes("fetch failed") ||
+    message.includes("service unavailable") ||
+    message.includes("gateway timeout")
+  );
+}
+
+function backoffWithJitterMs(attempt, baseDelayMs, maxDelayMs) {
+  const exp = Math.min(maxDelayMs, Math.round(baseDelayMs * (2 ** Math.max(0, attempt - 1))));
+  const jitter = Math.floor(Math.random() * Math.max(1, Math.round(exp * 0.35)));
+  return Math.min(maxDelayMs, exp + jitter);
+}
+
+async function sleep(ms) {
+  const wait = Math.max(0, Number(ms) || 0);
+  if (wait <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, wait));
+}
+
+function parseEnvInt(name, defaultValue, minValue, maxValue) {
+  const raw = process.env[name];
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  return clampInt(parsed, minValue, maxValue);
 }
 
 function relativeError(a, b) {

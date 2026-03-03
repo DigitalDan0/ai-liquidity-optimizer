@@ -85,6 +85,9 @@ PYTHONPATH=src python -m ai_liquidity_optimizer
 ```
 
 State is written to `state/optimizer_state.json` by default.
+Every cycle is also appended to `state/trade_journal.jsonl` (configurable).
+When using `EXECUTOR=meteora-node`, journal rows include on-chain wallet snapshots
+(`SOL`, `USDC`, and estimated total USD) plus cycle-over-cycle deltas.
 
 ## Enable Real Meteora Execution (Optional)
 
@@ -114,9 +117,24 @@ PYTHONPATH=src python -m ai_liquidity_optimizer --once
 
 - `REBALANCE_INTERVAL_MINUTES` (default `10`)
 - `RANGE_CHANGE_THRESHOLD_BPS` (rebalance trigger sensitivity)
+- `TRADE_JOURNAL_ENABLED` (default `true`)
+- `TRADE_JOURNAL_PATH` (default `state/trade_journal.jsonl`)
 - `METEORA_POOL_ADDRESS` (optional pool pinning)
 - `METEORA_POOL_QUERY` (used for discovery, default `SOL/USDC`)
 - `SYNTH_HORIZON` (default `24h`)
+
+## Analyze Trade Quality
+
+Generate a quick report from the JSONL trade journal:
+
+```bash
+python scripts/analyze_trade_journal.py --path state/trade_journal.jsonl --since-hours 24
+```
+
+Useful options:
+- `--last 200` to analyze only the most recent cycles
+- `--show-errors 10` to inspect recent execution failures/rate limits
+- `--csv-out state/trade_cycle_metrics.csv` to export per-cycle metrics (modeled P/L + rebalance timing)
 
 ## Limitations (MVP)
 
@@ -130,4 +148,3 @@ PYTHONPATH=src python -m ai_liquidity_optimizer --once
 
 - Includes `.gitignore`, `pyproject.toml`, `requirements.txt`, unit tests, and a basic GitHub Actions CI workflow.
 - Designed to run in dry-run mode by default for safe demo iteration.
-

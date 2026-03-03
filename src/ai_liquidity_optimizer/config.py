@@ -101,6 +101,10 @@ class Settings:
     ev_oor_max_penalty_fraction_15m: float
     ev_oor_persistence_step: float
     ev_oor_persistence_cap_cycles: int
+    ev_oor_grace_enabled: bool
+    ev_oor_grace_cycles: int
+    ev_oor_reentry_min_prob: float
+    ev_oor_loss_trigger_pct: float
     ev_idle_enabled: bool
     ev_idle_entry_threshold_usd: float
     ev_idle_exit_threshold_usd: float
@@ -117,6 +121,30 @@ class Settings:
     ev_trend_stop_oor_cycles: int
     ev_trend_stop_onesided_prob: float
     ev_action_cooldown_cycles: int
+    ev_policy_lifecycle_enabled: bool
+    ev_profit_take_pct: float
+    ev_profit_rebalance_max_slip_usd: float
+    ev_loss_recovery_trigger_pct: float
+    ev_high_il_15m_fraction: float
+    ev_recovery_min_prob: float
+    ev_trend_continue_exit_prob: float
+    ev_trend_exit_persistence_cycles: int
+    ev_idle_preference_edge_usd: float
+    ev_realism_enabled: bool
+    ev_realism_window_hours: int
+    ev_realism_min_samples: int
+    ev_fee_realism_prior: float
+    ev_fee_realism_min: float
+    ev_fee_realism_max: float
+    ev_rebalance_drag_prior_usd: float
+    ev_rebalance_drag_min_usd: float
+    ev_rebalance_drag_max_usd: float
+    ev_uncertainty_k: float
+    ev_dynamic_gate_enabled: bool
+    ev_dynamic_gate_base_margin_usd: float
+    ev_dynamic_gate_sigma_mult: float
+    ev_adjusted_ev_require_positive: bool
+    ev_realism_shadow_mode: bool
     executor: str
     meteora_liquidity_mode: str
     max_custom_weight_position_bins: int
@@ -132,6 +160,8 @@ class Settings:
     solana_rpc_url: str | None
     solana_private_key_b58: str | None
     state_path: Path
+    trade_journal_enabled: bool
+    trade_journal_path: Path
     log_level: str
     repo_root: Path
 
@@ -194,6 +224,12 @@ class Settings:
             raise ValueError("EV_OOR_PERSISTENCE_STEP must be >= 0.")
         if self.ev_oor_persistence_cap_cycles < 0:
             raise ValueError("EV_OOR_PERSISTENCE_CAP_CYCLES must be >= 0.")
+        if self.ev_oor_grace_cycles < 1:
+            raise ValueError("EV_OOR_GRACE_CYCLES must be >= 1.")
+        if self.ev_oor_reentry_min_prob < 0 or self.ev_oor_reentry_min_prob > 1:
+            raise ValueError("EV_OOR_REENTRY_MIN_PROB must be in [0, 1].")
+        if self.ev_oor_loss_trigger_pct < 0 or self.ev_oor_loss_trigger_pct > 1:
+            raise ValueError("EV_OOR_LOSS_TRIGGER_PCT must be in [0, 1].")
         if self.ev_idle_entry_threshold_usd < 0:
             raise ValueError("EV_IDLE_ENTRY_THRESHOLD_USD must be >= 0.")
         if self.ev_idle_exit_threshold_usd < 0:
@@ -222,6 +258,48 @@ class Settings:
             raise ValueError("EV_TREND_STOP_ONESIDED_PROB must be in [0, 1].")
         if self.ev_action_cooldown_cycles < 0:
             raise ValueError("EV_ACTION_COOLDOWN_CYCLES must be >= 0.")
+        if self.ev_profit_take_pct < 0 or self.ev_profit_take_pct > 1:
+            raise ValueError("EV_PROFIT_TAKE_PCT must be in [0, 1].")
+        if self.ev_profit_rebalance_max_slip_usd < 0:
+            raise ValueError("EV_PROFIT_REBALANCE_MAX_SLIP_USD must be >= 0.")
+        if self.ev_loss_recovery_trigger_pct < 0 or self.ev_loss_recovery_trigger_pct > 1:
+            raise ValueError("EV_LOSS_RECOVERY_TRIGGER_PCT must be in [0, 1].")
+        if self.ev_high_il_15m_fraction < 0 or self.ev_high_il_15m_fraction > 1:
+            raise ValueError("EV_HIGH_IL_15M_FRACTION must be in [0, 1].")
+        if self.ev_recovery_min_prob < 0 or self.ev_recovery_min_prob > 1:
+            raise ValueError("EV_RECOVERY_MIN_PROB must be in [0, 1].")
+        if self.ev_trend_continue_exit_prob < 0 or self.ev_trend_continue_exit_prob > 1:
+            raise ValueError("EV_TREND_CONTINUE_EXIT_PROB must be in [0, 1].")
+        if self.ev_trend_exit_persistence_cycles < 1:
+            raise ValueError("EV_TREND_EXIT_PERSISTENCE_CYCLES must be >= 1.")
+        if self.ev_idle_preference_edge_usd < 0:
+            raise ValueError("EV_IDLE_PREFERENCE_EDGE_USD must be >= 0.")
+        if self.ev_realism_window_hours <= 0:
+            raise ValueError("EV_REALISM_WINDOW_HOURS must be > 0.")
+        if self.ev_realism_min_samples <= 0:
+            raise ValueError("EV_REALISM_MIN_SAMPLES must be > 0.")
+        if self.ev_fee_realism_prior < 0 or self.ev_fee_realism_prior > 1:
+            raise ValueError("EV_FEE_REALISM_PRIOR must be in [0, 1].")
+        if self.ev_fee_realism_min < 0 or self.ev_fee_realism_min > 1:
+            raise ValueError("EV_FEE_REALISM_MIN must be in [0, 1].")
+        if self.ev_fee_realism_max < 0 or self.ev_fee_realism_max > 1:
+            raise ValueError("EV_FEE_REALISM_MAX must be in [0, 1].")
+        if self.ev_fee_realism_min > self.ev_fee_realism_max:
+            raise ValueError("EV_FEE_REALISM_MIN cannot exceed EV_FEE_REALISM_MAX.")
+        if self.ev_rebalance_drag_prior_usd < 0:
+            raise ValueError("EV_REBALANCE_DRAG_PRIOR_USD must be >= 0.")
+        if self.ev_rebalance_drag_min_usd < 0:
+            raise ValueError("EV_REBALANCE_DRAG_MIN_USD must be >= 0.")
+        if self.ev_rebalance_drag_max_usd < 0:
+            raise ValueError("EV_REBALANCE_DRAG_MAX_USD must be >= 0.")
+        if self.ev_rebalance_drag_min_usd > self.ev_rebalance_drag_max_usd:
+            raise ValueError("EV_REBALANCE_DRAG_MIN_USD cannot exceed EV_REBALANCE_DRAG_MAX_USD.")
+        if self.ev_uncertainty_k < 0:
+            raise ValueError("EV_UNCERTAINTY_K must be >= 0.")
+        if self.ev_dynamic_gate_base_margin_usd < 0:
+            raise ValueError("EV_DYNAMIC_GATE_BASE_MARGIN_USD must be >= 0.")
+        if self.ev_dynamic_gate_sigma_mult < 0:
+            raise ValueError("EV_DYNAMIC_GATE_SIGMA_MULT must be >= 0.")
         if self.pool_candidate_limit <= 0:
             raise ValueError("POOL_CANDIDATE_LIMIT must be > 0.")
         if self.top_k_ranges_per_pool <= 0:
@@ -252,6 +330,13 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
     state_path = Path(env.get("STATE_PATH", "state/optimizer_state.json"))
     if not state_path.is_absolute():
         state_path = repo_root / state_path
+    trade_journal_path_raw = env.get("TRADE_JOURNAL_PATH")
+    if trade_journal_path_raw:
+        trade_journal_path = Path(trade_journal_path_raw)
+        if not trade_journal_path.is_absolute():
+            trade_journal_path = repo_root / trade_journal_path
+    else:
+        trade_journal_path = state_path.parent / "trade_journal.jsonl"
 
     settings = Settings(
         ev_mode=_parse_bool(env.get("EV_MODE"), True),
@@ -302,6 +387,10 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
         ev_oor_max_penalty_fraction_15m=_parse_float(env.get("EV_OOR_MAX_PENALTY_FRACTION_15M"), 0.0015),
         ev_oor_persistence_step=_parse_float(env.get("EV_OOR_PERSISTENCE_STEP"), 0.20),
         ev_oor_persistence_cap_cycles=_parse_int(env.get("EV_OOR_PERSISTENCE_CAP_CYCLES"), 12),
+        ev_oor_grace_enabled=_parse_bool(env.get("EV_OOR_GRACE_ENABLED"), True),
+        ev_oor_grace_cycles=_parse_int(env.get("EV_OOR_GRACE_CYCLES"), 2),
+        ev_oor_reentry_min_prob=_parse_float(env.get("EV_OOR_REENTRY_MIN_PROB"), 0.60),
+        ev_oor_loss_trigger_pct=_parse_float(env.get("EV_OOR_LOSS_TRIGGER_PCT"), 0.0),
         ev_idle_enabled=_parse_bool(env.get("EV_IDLE_ENABLED"), True),
         ev_idle_entry_threshold_usd=_parse_float(env.get("EV_IDLE_ENTRY_THRESHOLD_USD"), 0.0),
         ev_idle_exit_threshold_usd=_parse_float(env.get("EV_IDLE_EXIT_THRESHOLD_USD"), 0.01),
@@ -318,6 +407,30 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
         ev_trend_stop_oor_cycles=_parse_int(env.get("EV_TREND_STOP_OOR_CYCLES"), 3),
         ev_trend_stop_onesided_prob=_parse_float(env.get("EV_TREND_STOP_ONESIDED_PROB"), 0.65),
         ev_action_cooldown_cycles=_parse_int(env.get("EV_ACTION_COOLDOWN_CYCLES"), 1),
+        ev_policy_lifecycle_enabled=_parse_bool(env.get("EV_POLICY_LIFECYCLE_ENABLED"), True),
+        ev_profit_take_pct=_parse_float(env.get("EV_PROFIT_TAKE_PCT"), 0.015),
+        ev_profit_rebalance_max_slip_usd=_parse_float(env.get("EV_PROFIT_REBALANCE_MAX_SLIP_USD"), 0.002),
+        ev_loss_recovery_trigger_pct=_parse_float(env.get("EV_LOSS_RECOVERY_TRIGGER_PCT"), 0.020),
+        ev_high_il_15m_fraction=_parse_float(env.get("EV_HIGH_IL_15M_FRACTION"), 0.0006),
+        ev_recovery_min_prob=_parse_float(env.get("EV_RECOVERY_MIN_PROB"), 0.55),
+        ev_trend_continue_exit_prob=_parse_float(env.get("EV_TREND_CONTINUE_EXIT_PROB"), 0.72),
+        ev_trend_exit_persistence_cycles=_parse_int(env.get("EV_TREND_EXIT_PERSISTENCE_CYCLES"), 2),
+        ev_idle_preference_edge_usd=_parse_float(env.get("EV_IDLE_PREFERENCE_EDGE_USD"), 0.01),
+        ev_realism_enabled=_parse_bool(env.get("EV_REALISM_ENABLED"), True),
+        ev_realism_window_hours=_parse_int(env.get("EV_REALISM_WINDOW_HOURS"), 168),
+        ev_realism_min_samples=_parse_int(env.get("EV_REALISM_MIN_SAMPLES"), 30),
+        ev_fee_realism_prior=_parse_float(env.get("EV_FEE_REALISM_PRIOR"), 0.35),
+        ev_fee_realism_min=_parse_float(env.get("EV_FEE_REALISM_MIN"), 0.10),
+        ev_fee_realism_max=_parse_float(env.get("EV_FEE_REALISM_MAX"), 0.85),
+        ev_rebalance_drag_prior_usd=_parse_float(env.get("EV_REBALANCE_DRAG_PRIOR_USD"), 0.010),
+        ev_rebalance_drag_min_usd=_parse_float(env.get("EV_REBALANCE_DRAG_MIN_USD"), 0.000),
+        ev_rebalance_drag_max_usd=_parse_float(env.get("EV_REBALANCE_DRAG_MAX_USD"), 0.050),
+        ev_uncertainty_k=_parse_float(env.get("EV_UNCERTAINTY_K"), 1.00),
+        ev_dynamic_gate_enabled=_parse_bool(env.get("EV_DYNAMIC_GATE_ENABLED"), True),
+        ev_dynamic_gate_base_margin_usd=_parse_float(env.get("EV_DYNAMIC_GATE_BASE_MARGIN_USD"), 0.003),
+        ev_dynamic_gate_sigma_mult=_parse_float(env.get("EV_DYNAMIC_GATE_SIGMA_MULT"), 1.00),
+        ev_adjusted_ev_require_positive=_parse_bool(env.get("EV_ADJUSTED_EV_REQUIRE_POSITIVE"), True),
+        ev_realism_shadow_mode=_parse_bool(env.get("EV_REALISM_SHADOW_MODE"), False),
         executor=env.get("EXECUTOR", "dry-run"),
         meteora_liquidity_mode=env.get("METEORA_LIQUIDITY_MODE", "spot").strip().lower(),
         max_custom_weight_position_bins=_parse_int(env.get("MAX_CUSTOM_WEIGHT_POSITION_BINS"), 70),
@@ -333,6 +446,8 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
         solana_rpc_url=env.get("SOLANA_RPC_URL"),
         solana_private_key_b58=env.get("SOLANA_PRIVATE_KEY_B58"),
         state_path=state_path,
+        trade_journal_enabled=_parse_bool(env.get("TRADE_JOURNAL_ENABLED"), True),
+        trade_journal_path=trade_journal_path,
         log_level=env.get("LOG_LEVEL", "INFO").upper(),
         repo_root=repo_root,
     )

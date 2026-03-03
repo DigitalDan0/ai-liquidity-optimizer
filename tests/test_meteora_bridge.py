@@ -156,6 +156,59 @@ class MeteoraBridgeTests(unittest.TestCase):
         self.assertIsNotNone(bridge.last_payload)
         self.assertEqual(bridge.last_payload.get("command"), "close-position")
 
+    def test_get_onchain_snapshot_normalizes_fields(self):
+        bridge = _StubBridge(
+            {
+                "ok": True,
+                "snapshot_at": "2026-03-02T13:00:00+00:00",
+                "wallet_pubkey": "Wallet111",
+                "sol_balance": 0.1234,
+                "usdc_balance": 9.87,
+                "native_sol_balance": 0.0234,
+                "wallet_sol_token_balance": 0.1,
+                "wallet_sol_total_balance": 0.1234,
+                "wallet_usdc_total_balance": 9.87,
+                "wallet_total_usd_est": 19.11,
+                "position_total_usd_est": 1.10,
+                "total_usd_est": 20.21,
+                "spot_price_sol_usdc": 84.0,
+                "active_position_exists": True,
+                "position_snapshot": {"position_pubkey": "Pos111", "total_usd_est": 1.10},
+                "pool_balances": {"wallet_sol_total_ui": 0.1234, "wallet_usdc_ui": 9.87},
+            }
+        )
+        snapshot = bridge.get_onchain_snapshot(pool=None, active_position=None)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.get("wallet_pubkey"), "Wallet111")
+        self.assertAlmostEqual(float(snapshot.get("sol_balance")), 0.1234, places=6)
+        self.assertAlmostEqual(float(snapshot.get("usdc_balance")), 9.87, places=6)
+        self.assertAlmostEqual(float(snapshot.get("total_usd_est")), 20.21, places=6)
+        self.assertAlmostEqual(float(snapshot.get("wallet_total_usd_est")), 19.11, places=6)
+        self.assertAlmostEqual(float(snapshot.get("position_total_usd_est")), 1.10, places=6)
+        self.assertEqual(snapshot.get("position_snapshot", {}).get("position_pubkey"), "Pos111")
+        self.assertEqual(snapshot.get("active_position_exists"), True)
+        self.assertIsNotNone(bridge.last_payload)
+        self.assertEqual(bridge.last_payload.get("command"), "wallet-snapshot")
+
+    def test_get_onchain_snapshot_reconstructs_total_when_missing(self):
+        bridge = _StubBridge(
+            {
+                "ok": True,
+                "snapshot_at": "2026-03-02T13:00:00+00:00",
+                "wallet_pubkey": "Wallet111",
+                "wallet_total_usd_est": 11.5,
+                "position_snapshot": {"total_usd_est": 2.25},
+                "spot_price_sol_usdc": 84.0,
+            }
+        )
+        snapshot = bridge.get_onchain_snapshot(pool=None, active_position=None)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertAlmostEqual(float(snapshot.get("wallet_total_usd_est")), 11.5, places=6)
+        self.assertAlmostEqual(float(snapshot.get("position_total_usd_est")), 2.25, places=6)
+        self.assertAlmostEqual(float(snapshot.get("total_usd_est")), 13.75, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

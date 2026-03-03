@@ -165,9 +165,18 @@ def _summarize_once_result_ev(result: dict[str, Any]) -> str:
     top_bins = _format_top_bins(bin_plan=bin_plan, limit=5)
 
     ev_best = best.get("ev_15m_usd", chosen.get("ev_15m_usd", chosen.get("score")))
+    ev_best_raw = result.get("ev_best_raw_usd", chosen.get("raw_ev_15m_usd"))
+    ev_best_adjusted = result.get("ev_best_adjusted_usd", chosen.get("adjusted_ev_15m_usd"))
     ev_hold = hold.get("ev_15m_usd")
+    ev_hold_raw = result.get("ev_hold_raw_usd")
+    ev_hold_adjusted = result.get("ev_hold_adjusted_usd")
     ev_delta = result.get("ev_delta_usd")
     hold_components = hold.get("ev_components") if isinstance(hold.get("ev_components"), dict) else {}
+    lifecycle_pnl = result.get("lifecycle_pnl_usd")
+    lifecycle_pct = result.get("lifecycle_pnl_pct")
+    policy_override = result.get("policy_selected_override")
+    realism = result.get("realism") if isinstance(result.get("realism"), dict) else {}
+    realism_snapshot = realism.get("snapshot") if isinstance(realism.get("snapshot"), dict) else {}
 
     return (
         "RUN_ONCE_EV "
@@ -178,14 +187,26 @@ def _summarize_once_result_ev(result: dict[str, Any]) -> str:
         f"active_range=[{_fmt_num(active_position.get('lower_price'), 4)},{_fmt_num(active_position.get('upper_price'), 4)}] "
         f"range=[{_fmt_num(chosen.get('lower_bound'), 4)},{_fmt_num(chosen.get('upper_bound'), 4)}] "
         f"w={_fmt_num(chosen.get('width_pct'), 2)}% "
-        f"EV15m={_fmt_num(ev_best, 4)} "
-        f"hold={_fmt_num(ev_hold, 4)} "
+        f"EVraw={_fmt_num(ev_best_raw, 4)} "
+        f"EVadj={_fmt_num(ev_best_adjusted, 4)} "
+        f"EV_used={_fmt_num(ev_best, 4)} "
+        f"hold_raw={_fmt_num(ev_hold_raw, 4)} "
+        f"hold_adj={_fmt_num(ev_hold_adjusted, 4)} "
+        f"hold_used={_fmt_num(ev_hold, 4)} "
         f"delta={_fmt_num(ev_delta, 4)} "
+        f"min_delta_eff={_fmt_num(result.get('effective_min_delta_usd'), 4)} "
         f"action={result.get('selected_action')} "
+        f"lifecycle_pnl={_fmt_num(lifecycle_pnl, 4)} "
+        f"lifecycle_pct={_fmt_num((float(lifecycle_pct) * 100.0) if lifecycle_pct is not None else None, 2)}% "
+        f"policy={policy_override} "
         f"fees={_fmt_num(best_components.get('expected_fees_usd'), 4)} "
+        f"fees_raw={_fmt_num(best_components.get('raw_expected_fees_usd'), 4)} "
+        f"fees_adj={_fmt_num(best_components.get('adjusted_expected_fees_usd'), 4)} "
         f"il={_fmt_num(best_components.get('expected_il_usd'), 4)} "
         f"il_base={_fmt_num(best_components.get('il_baseline_usd'), 4)} "
         f"il_pen={_fmt_num(best_components.get('il_state_penalty_usd'), 4)} "
+        f"drag={_fmt_num(best_components.get('execution_drag_usd'), 4)} "
+        f"unc={_fmt_num(best_components.get('uncertainty_penalty_usd'), 4)} "
         f"il_mult={_fmt_num(best_components.get('il_multiplier'), 3)} "
         f"drift_bps={_fmt_num(best_components.get('p50_drift_bps'), 1)} "
         f"oor_p={_fmt_num(best_components.get('out_of_range_prob_15m'), 3)} "
@@ -215,6 +236,10 @@ def _summarize_once_result_ev(result: dict[str, Any]) -> str:
         f"gate={gate.get('gate_mode')} ev:{gate.get('ev_threshold_passed')} structural:{gate.get('structural_change_passed')} "
         f"protective_breach={gate.get('protective_breach_count')} "
         f"rebalance={rebalance.get('should_rebalance')} close_idle={rebalance.get('should_close_to_idle')}({rebalance.get('reason')}) "
+        f"realism={realism.get('use_adjusted_for_decisions')}:{realism_snapshot.get('mode')}/{realism_snapshot.get('sample_count')} "
+        f"fee_mult={_fmt_num(realism_snapshot.get('fee_realism_multiplier'), 3)} "
+        f"drag_cal={_fmt_num(realism_snapshot.get('rebalance_drag_usd'), 4)} "
+        f"rmse={_fmt_num(realism_snapshot.get('model_rmse_usd'), 4)} "
         f"top_bins={top_bins}"
     )
 

@@ -101,6 +101,25 @@ def _weighted_plan(*, lower: float = 95.0, upper: float = 105.0, weights: list[f
 
 
 class EvLpScorerTests(unittest.TestCase):
+    def test_recovery_probability_helper(self):
+        scorer = EvLpScorer()
+        value = scorer.compute_recovery_probability(
+            range_active_occupancy_15m=0.80,
+            one_sided_break_prob=0.20,
+            directional_confidence=0.30,
+        )
+        expected = 0.50 * (1.0 - 0.20) + 0.35 * 0.80 + 0.15 * (1.0 - 0.30)
+        self.assertAlmostEqual(value, expected, places=9)
+
+    def test_trend_continuation_probability_helper(self):
+        scorer = EvLpScorer()
+        value = scorer.compute_trend_continuation_probability(
+            one_sided_break_prob=0.70,
+            directional_confidence=0.40,
+        )
+        expected = 0.70 * 0.70 + 0.30 * 0.40
+        self.assertAlmostEqual(value, expected, places=9)
+
     def test_pool_pre_rank_uses_more_than_tvl(self):
         scorer = EvLpScorer()
         high_tvl_low_fee = _pool(

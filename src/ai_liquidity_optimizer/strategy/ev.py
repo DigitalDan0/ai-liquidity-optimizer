@@ -147,6 +147,29 @@ class EvLpScorer:
         persistence_mult = 1.0 + capped_cycles * self.ev_oor_persistence_step
         return min(self.ev_oor_max_penalty_fraction_15m, base_frac * persistence_mult)
 
+    def compute_recovery_probability(
+        self,
+        *,
+        range_active_occupancy_15m: float,
+        one_sided_break_prob: float,
+        directional_confidence: float,
+    ) -> float:
+        recovery = (
+            0.50 * (1.0 - one_sided_break_prob)
+            + 0.35 * range_active_occupancy_15m
+            + 0.15 * (1.0 - directional_confidence)
+        )
+        return clamp(recovery, 0.0, 1.0)
+
+    def compute_trend_continuation_probability(
+        self,
+        *,
+        one_sided_break_prob: float,
+        directional_confidence: float,
+    ) -> float:
+        trend = 0.70 * one_sided_break_prob + 0.30 * directional_confidence
+        return clamp(trend, 0.0, 1.0)
+
     def concentration_factor(
         self,
         *,

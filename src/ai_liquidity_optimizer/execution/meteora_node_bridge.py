@@ -5,6 +5,7 @@ import logging
 import math
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from ai_liquidity_optimizer.execution.base import PositionExecutor
 from ai_liquidity_optimizer.models import ActivePositionState, ExecutionApplyRequest, ExecutionApplyResult, ExecutorRangeBinQuote
@@ -135,6 +136,101 @@ class MeteoraNodeBridgeExecutor(PositionExecutor):
             tx_signatures=[str(x) for x in result.get("tx_signatures", []) if isinstance(x, str)],
             details={k: v for k, v in result.items() if k not in {"ok", "changed", "active_position", "tx_signatures"}},
         )
+
+    def get_onchain_snapshot(
+        self,
+        *,
+        pool: Any | None = None,
+        active_position: ActivePositionState | None = None,
+    ) -> dict[str, Any] | None:
+        payload: dict[str, Any] = {
+            "command": "wallet-snapshot",
+            "rpc_url": self.rpc_url,
+            "private_key_b58": self.private_key_b58,
+        }
+        if pool is not None:
+            payload["pool"] = {
+                "address": getattr(pool, "address", None),
+                "name": getattr(pool, "name", None),
+                "mint_x": getattr(pool, "mint_x", None),
+                "mint_y": getattr(pool, "mint_y", None),
+                "symbol_x": getattr(pool, "symbol_x", None),
+                "symbol_y": getattr(pool, "symbol_y", None),
+                "decimals_x": getattr(pool, "decimals_x", None),
+                "decimals_y": getattr(pool, "decimals_y", None),
+                "api_current_price": getattr(pool, "current_price", None),
+            }
+        if active_position is not None:
+            payload["active_position"] = active_position.to_dict()
+        result = self._run_node(payload)
+        pool_balances = result.get("pool_balances") if isinstance(result.get("pool_balances"), dict) else None
+        position_snapshot = result.get("position_snapshot") if isinstance(result.get("position_snapshot"), dict) else None
+
+        spot_price = self._first_valid_float(
+            result.get("spot_price_sol_usdc"),
+            self._dict_get(pool_balances, "spot_sol_usdc"),
+        )
+        sol_balance = self._first_valid_float(
+            result.get("sol_balance"),
+            result.get("wallet_sol_total_balance"),
+            result.get("wallet_sol_total_ui"),
+            self._dict_get(pool_balances, "wallet_sol_total_ui"),
+            self._dict_get(pool_balances, "sol_ui"),
+        )
+        usdc_balance = self._first_valid_float(
+            result.get("usdc_balance"),
+            result.get("wallet_usdc_total_balance"),
+            result.get("wallet_usdc_total_ui"),
+            self._dict_get(pool_balances, "wallet_usdc_ui"),
+            self._dict_get(pool_balances, "usdc_ui"),
+        )
+        wallet_total_usd = self._first_valid_float(
+            result.get("wallet_total_usd_est"),
+            self._dict_get(pool_balances, "wallet_total_usd_est"),
+            self._dict_get(pool_balances, "total_usd_est"),
+        )
+        position_total_usd = self._first_valid_float(
+            result.get("position_total_usd_est"),
+            self._dict_get(position_snapshot, "total_usd_est"),
+        )
+        total_usd = self._first_valid_float(result.get("total_usd_est"))
+        if total_usd is None and (wallet_total_usd is not None or position_total_usd is not None):
+            total_usd = float(wallet_total_usd or 0.0) + float(position_total_usd or 0.0)
+
+        # Normalize to a stable shape used by orchestrator/journal.
+        snapshot: dict[str, Any] = {
+            "source": "meteora-node",
+            "snapshot_at": str(result.get("snapshot_at") or ""),
+            "wallet_pubkey": result.get("wallet_pubkey"),
+            "sol_balance": sol_balance,
+            "usdc_balance": usdc_balance,
+            "total_usd_est": total_usd,
+            "spot_price_sol_usdc": spot_price,
+            "active_position_exists": bool(result.get("active_position_exists")) if result.get("active_position_exists") is not None else None,
+            "native_sol_balance": self._first_valid_float(result.get("native_sol_balance")),
+            "wallet_sol_token_balance": self._first_valid_float(
+                result.get("wallet_sol_token_balance"),
+                result.get("wallet_sol_token_ui"),
+                self._dict_get(pool_balances, "wallet_sol_token_ui"),
+            ),
+            "wallet_sol_total_balance": self._first_valid_float(
+                result.get("wallet_sol_total_balance"),
+                result.get("wallet_sol_total_ui"),
+                self._dict_get(pool_balances, "wallet_sol_total_ui"),
+                self._dict_get(pool_balances, "sol_ui"),
+            ),
+            "wallet_usdc_total_balance": self._first_valid_float(
+                result.get("wallet_usdc_total_balance"),
+                result.get("wallet_usdc_total_ui"),
+                self._dict_get(pool_balances, "wallet_usdc_ui"),
+                self._dict_get(pool_balances, "usdc_ui"),
+            ),
+            "wallet_total_usd_est": wallet_total_usd,
+            "position_total_usd_est": position_total_usd,
+            "position_snapshot": position_snapshot,
+            "pool_balances": pool_balances,
+        }
+        return snapshot
 
     def quote_target_bins(
         self,
@@ -313,6 +409,32 @@ class MeteoraNodeBridgeExecutor(PositionExecutor):
                 cur = prev * (1.0 + 1e-9)
                 filled[i] = cur
         return filled
+
+    @staticmethod
+    def _coerce_optional_float(value: object) -> float | None:
+        try:
+            if value is None:
+                return None
+            val = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(val):
+            return None
+        return val
+
+    @classmethod
+    def _first_valid_float(cls, *values: object) -> float | None:
+        for value in values:
+            parsed = cls._coerce_optional_float(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _dict_get(payload: dict[str, Any] | None, key: str) -> object:
+        if not isinstance(payload, dict):
+            return None
+        return payload.get(key)
 
     def _run_node(self, payload: dict) -> dict:
         proc = subprocess.run(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from ai_liquidity_optimizer.models import ActivePositionState, ExecutionApplyRequest, ExecutionApplyResult, ExecutorRangeBinQuote
 
@@ -37,6 +38,15 @@ class PositionExecutor(ABC):
             tx_signatures=[],
             details={"message": "close_position is not supported by this executor"},
         )
+
+    def get_onchain_snapshot(
+        self,
+        *,
+        pool: Any | None = None,
+        active_position: ActivePositionState | None = None,
+    ) -> dict[str, Any] | None:
+        """Optional hook to fetch on-chain wallet/PnL snapshot data."""
+        return None
 
     @abstractmethod
     def apply_target_range(self, request: ExecutionApplyRequest) -> ExecutionApplyResult:

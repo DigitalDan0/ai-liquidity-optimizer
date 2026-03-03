@@ -277,6 +277,14 @@ class EvComponentBreakdown:
     one_sided_break_prob: float | None = None
     directional_confidence: float | None = None
     expected_out_of_range_minutes_15m: float | None = None
+    raw_expected_fees_usd: float | None = None
+    fee_realism_multiplier: float | None = None
+    adjusted_expected_fees_usd: float | None = None
+    execution_drag_usd: float | None = None
+    uncertainty_penalty_usd: float | None = None
+    adjusted_ev_15m_usd: float | None = None
+    calibration_sample_count: int | None = None
+    calibration_mode: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
