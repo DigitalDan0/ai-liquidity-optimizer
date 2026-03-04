@@ -673,6 +673,9 @@ class OptimizerOrchestrator:
                     exc,
                 )
                 return fallback
+            synth_fallback = self._fallback_pool_candidates_from_synth(state=state, cause=exc)
+            if synth_fallback:
+                return synth_fallback
             raise
 
     def _fallback_pool_candidates_from_state(self, *, state: BotState | None) -> list[MeteoraPoolSnapshot]:
@@ -732,6 +735,117 @@ class OptimizerOrchestrator:
             is_blacklisted=False,
         )
         return [fallback_pool]
+
+    def _fallback_pool_candidates_from_synth(
+        self,
+        *,
+        state: BotState | None,
+        cause: Exception,
+    ) -> list[MeteoraPoolSnapshot]:
+        pool_address = str(self.settings.meteora_pool_address or "").strip()
+        if not pool_address:
+            return []
+
+        spot = self._fetch_synth_spot_for_pool_fallback()
+        if spot is None or spot <= 0:
+            spot = self._fallback_spot_from_state(state=state)
+        if spot is None or spot <= 0:
+            return []
+
+        selected_pool = self._extract_selected_pool_from_state(state=state)
+        tvl = self._safe_float(selected_pool.get("tvl")) if isinstance(selected_pool, dict) else None
+        bin_step_bps = self._safe_float(selected_pool.get("bin_step_bps")) if isinstance(selected_pool, dict) else None
+        base_fee_pct = self._safe_float(selected_pool.get("base_fee_pct")) if isinstance(selected_pool, dict) else None
+        dynamic_fee_pct = self._safe_float(selected_pool.get("dynamic_fee_pct")) if isinstance(selected_pool, dict) else None
+
+        fee_tvl_ratio_24h: float | None = None
+        if state is not None and isinstance(state.last_decision, dict):
+            ev_best = state.last_decision.get("ev_best_candidate")
+            if isinstance(ev_best, dict):
+                ev_components = ev_best.get("ev_components")
+                if isinstance(ev_components, dict):
+                    fee_rate_15m = self._safe_float(ev_components.get("fee_rate_15m_fraction"))
+                    if fee_rate_15m is not None and fee_rate_15m > 0:
+                        fee_tvl_ratio_24h = max(0.0, fee_rate_15m * (1440.0 / 15.0))
+
+        fallback_pool = MeteoraPoolSnapshot(
+            address=pool_address,
+            name=str((selected_pool or {}).get("name") or "SOL-USDC (synth-fallback)"),
+            mint_x="",
+            mint_y="",
+            symbol_x="SOL",
+            symbol_y="USDC",
+            decimals_x=9,
+            decimals_y=6,
+            current_price=float(spot),
+            liquidity=float(tvl or 0.0),
+            volume_24h=0.0,
+            fees_24h=0.0,
+            fee_tvl_ratio_24h=fee_tvl_ratio_24h,
+            raw={
+                "fallback_source": "synth.spot",
+                "fallback_cause": str(cause),
+            },
+            tvl=float(tvl or 0.0),
+            bin_step_bps=bin_step_bps,
+            base_fee_pct=base_fee_pct,
+            dynamic_fee_pct=dynamic_fee_pct,
+            is_blacklisted=False,
+        )
+        LOGGER.warning(
+            "Using Synth-derived pool snapshot fallback for %s due to Meteora API failure: %s",
+            pool_address,
+            cause,
+        )
+        return [fallback_pool]
+
+    def _fetch_synth_spot_for_pool_fallback(self) -> float | None:
+        try:
+            lp_probabilities = self.synth_client.get_lp_probabilities(
+                asset=self.settings.synth_asset,
+                horizon=self.settings.synth_horizon,
+                days=self.settings.synth_days,
+            )
+        except Exception as exc:
+            LOGGER.warning("Synth lp-probabilities spot fallback unavailable: %s", exc)
+            return None
+        spot = self._safe_float(getattr(lp_probabilities, "current_price", None))
+        if spot is None or spot <= 0:
+            return None
+        return float(spot)
+
+    def _fallback_spot_from_state(self, *, state: BotState | None) -> float | None:
+        selected_pool = self._extract_selected_pool_from_state(state=state)
+        if isinstance(selected_pool, dict):
+            spot = self._safe_float(selected_pool.get("current_price"))
+            if spot is not None and spot > 0:
+                return float(spot)
+        if state is not None and state.active_position is not None:
+            lower = float(min(state.active_position.lower_price, state.active_position.upper_price))
+            upper = float(max(state.active_position.lower_price, state.active_position.upper_price))
+            mid = (lower + upper) / 2.0
+            if mid > 0:
+                return mid
+        if state is not None and isinstance(state.last_decision, dict):
+            chosen = state.last_decision.get("chosen")
+            if isinstance(chosen, dict):
+                lower = self._safe_float(chosen.get("lower_bound"))
+                upper = self._safe_float(chosen.get("upper_bound"))
+                if lower is not None and upper is not None and upper > 0:
+                    return (lower + upper) / 2.0
+        return None
+
+    @staticmethod
+    def _extract_selected_pool_from_state(*, state: BotState | None) -> dict[str, Any] | None:
+        if state is None or not isinstance(state.last_decision, dict):
+            return None
+        selected_pool = state.last_decision.get("selected_pool")
+        if isinstance(selected_pool, dict):
+            return selected_pool
+        pool = state.last_decision.get("pool")
+        if isinstance(pool, dict):
+            return pool
+        return None
 
     def _scoring_uses_exact_objective(self) -> bool:
         return (

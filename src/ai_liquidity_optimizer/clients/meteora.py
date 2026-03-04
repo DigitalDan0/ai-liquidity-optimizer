@@ -66,6 +66,10 @@ class MeteoraDlmmApiClient:
                         exc,
                     )
                     return cached
+                if _looks_like_timeout_error(exc):
+                    raise RuntimeError(
+                        f"Configured pool {configured_address} fetch timed out and no cached snapshot is available"
+                    ) from exc
                 fallback = self._find_pool_by_address_via_listing(configured_address=configured_address, query=query)
                 if fallback is not None:
                     LOGGER.warning(
@@ -239,6 +243,11 @@ def _parse_metric_window_map(value: Any) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _looks_like_timeout_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "timed out" in message or "timeout" in message
 
 
 def _meteora_headers() -> dict[str, str]:

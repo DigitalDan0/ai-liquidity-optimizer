@@ -48,11 +48,11 @@ def test_find_pool_uses_cached_snapshot_on_direct_fetch_timeout():
     assert second.current_price == first.current_price
 
 
-def test_find_pool_uses_listing_fallback_when_direct_fetch_fails_without_cache():
+def test_find_pool_uses_listing_fallback_for_non_timeout_fetch_failure_without_cache():
     address = "BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y"
     http = _SequenceHttpClient(
         responses=[
-            RuntimeError("The read operation timed out"),
+            RuntimeError("upstream 503"),
             {"data": [_pool_payload(address)]},
         ]
     )
@@ -62,3 +62,19 @@ def test_find_pool_uses_listing_fallback_when_direct_fetch_fails_without_cache()
     assert pool.address == address
     assert pool.symbol_x == "SOL"
     assert pool.symbol_y == "USDC"
+
+
+def test_find_pool_does_not_attempt_listing_fallback_for_timeout_without_cache():
+    address = "BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y"
+    http = _SequenceHttpClient(
+        responses=[
+            RuntimeError("The read operation timed out"),
+        ]
+    )
+    client = MeteoraDlmmApiClient(base_url="https://example.invalid", http_client=http)
+
+    try:
+        client.find_sol_usdc_pool(pool_address=address, query="SOL/USDC")
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "timed out" in str(exc).lower()

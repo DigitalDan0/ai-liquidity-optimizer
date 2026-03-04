@@ -44,16 +44,19 @@ class _FailingMeteoraClient:
 
 
 class OrchestratorPoolFallbackTests(unittest.TestCase):
-    def _orchestrator(self) -> OptimizerOrchestrator:
+    def _orchestrator(self, synth_client=None) -> OptimizerOrchestrator:
         settings = SimpleNamespace(
             meteora_pool_address="BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y",
             meteora_pool_query="SOL/USDC",
             pool_candidate_limit=12,
             min_pool_tvl_usd=100_000.0,
+            synth_asset="SOL",
+            synth_horizon="1h",
+            synth_days=30,
         )
         return OptimizerOrchestrator(
             settings=settings,
-            synth_client=SimpleNamespace(),
+            synth_client=synth_client or SimpleNamespace(),
             meteora_client=_FailingMeteoraClient(),
             scorer=StrategyScorer(),
             ev_scorer=EvLpScorer(),
@@ -100,6 +103,18 @@ class OrchestratorPoolFallbackTests(unittest.TestCase):
         orchestrator = self._orchestrator()
         with self.assertRaises(RuntimeError):
             orchestrator._load_pool_candidates(state=BotState())
+
+    def test_load_pool_candidates_uses_synth_spot_when_state_fallback_missing(self):
+        synth_client = SimpleNamespace(get_lp_probabilities=lambda asset, horizon, days: SimpleNamespace(current_price=91.25))
+        orchestrator = self._orchestrator(synth_client=synth_client)
+
+        pools = orchestrator._load_pool_candidates(state=BotState())
+        self.assertEqual(len(pools), 1)
+        pool = pools[0]
+        self.assertEqual(pool.address, "BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y")
+        self.assertAlmostEqual(pool.current_price, 91.25, places=9)
+        self.assertEqual(pool.symbol_x, "SOL")
+        self.assertEqual(pool.symbol_y, "USDC")
 
 
 if __name__ == "__main__":
