@@ -259,7 +259,7 @@ class OptimizerOrchestrator:
 
     def _run_once_ev(self, state: BotState) -> dict:
         assert self.ev_scorer is not None
-        pools = self._load_pool_candidates()
+        pools = self._load_pool_candidates(state=state)
         if not pools:
             raise RuntimeError("No eligible SOL/USDC Meteora pools after filtering")
 
@@ -651,19 +651,87 @@ class OptimizerOrchestrator:
         self.state_store.save(state)
         return state.last_decision
 
-    def _load_pool_candidates(self) -> list[MeteoraPoolSnapshot]:
-        if self.settings.meteora_pool_address:
-            return [
-                self.meteora_client.find_sol_usdc_pool(
-                    pool_address=self.settings.meteora_pool_address,
-                    query=self.settings.meteora_pool_query,
+    def _load_pool_candidates(self, *, state: BotState | None = None) -> list[MeteoraPoolSnapshot]:
+        try:
+            if self.settings.meteora_pool_address:
+                return [
+                    self.meteora_client.find_sol_usdc_pool(
+                        pool_address=self.settings.meteora_pool_address,
+                        query=self.settings.meteora_pool_query,
+                    )
+                ]
+            return self.meteora_client.list_sol_usdc_pool_candidates(
+                query=self.settings.meteora_pool_query,
+                per_page=max(200, self.settings.pool_candidate_limit * 4),
+                min_tvl_usd=self.settings.min_pool_tvl_usd,
+            )
+        except Exception as exc:
+            fallback = self._fallback_pool_candidates_from_state(state=state)
+            if fallback:
+                LOGGER.warning(
+                    "Using stale pool snapshot fallback from local state due to Meteora API failure: %s",
+                    exc,
                 )
-            ]
-        return self.meteora_client.list_sol_usdc_pool_candidates(
-            query=self.settings.meteora_pool_query,
-            per_page=max(200, self.settings.pool_candidate_limit * 4),
-            min_tvl_usd=self.settings.min_pool_tvl_usd,
+                return fallback
+            raise
+
+    def _fallback_pool_candidates_from_state(self, *, state: BotState | None) -> list[MeteoraPoolSnapshot]:
+        if state is None or not isinstance(state.last_decision, dict):
+            return []
+        selected_pool = state.last_decision.get("selected_pool")
+        if not isinstance(selected_pool, dict):
+            selected_pool = state.last_decision.get("pool")
+        if not isinstance(selected_pool, dict):
+            return []
+
+        address = str(selected_pool.get("address") or "").strip()
+        if not address:
+            return []
+        if self.settings.meteora_pool_address and address != self.settings.meteora_pool_address:
+            return []
+
+        symbol_x = str(selected_pool.get("symbol_x") or "SOL").upper()
+        symbol_y = str(selected_pool.get("symbol_y") or "USDC").upper()
+        if {symbol_x, symbol_y} != {"SOL", "USDC"}:
+            return []
+
+        current_price = self._safe_float(selected_pool.get("current_price")) or 0.0
+        tvl = self._safe_float(selected_pool.get("tvl")) or 0.0
+        bin_step_bps = self._safe_float(selected_pool.get("bin_step_bps"))
+        base_fee_pct = self._safe_float(selected_pool.get("base_fee_pct"))
+        dynamic_fee_pct = self._safe_float(selected_pool.get("dynamic_fee_pct"))
+
+        fee_tvl_ratio_24h: float | None = None
+        ev_best = state.last_decision.get("ev_best_candidate")
+        if isinstance(ev_best, dict):
+            ev_components = ev_best.get("ev_components")
+            if isinstance(ev_components, dict):
+                fee_rate_15m = self._safe_float(ev_components.get("fee_rate_15m_fraction"))
+                if fee_rate_15m is not None and fee_rate_15m > 0:
+                    fee_tvl_ratio_24h = max(0.0, fee_rate_15m * (1440.0 / 15.0))
+
+        fallback_pool = MeteoraPoolSnapshot(
+            address=address,
+            name=str(selected_pool.get("name") or "SOL-USDC (state-fallback)"),
+            mint_x="",
+            mint_y="",
+            symbol_x=symbol_x,
+            symbol_y=symbol_y,
+            decimals_x=9 if symbol_x == "SOL" else 6,
+            decimals_y=6 if symbol_y == "USDC" else 9,
+            current_price=current_price,
+            liquidity=tvl,
+            volume_24h=0.0,
+            fees_24h=0.0,
+            fee_tvl_ratio_24h=fee_tvl_ratio_24h,
+            raw={"fallback_source": "state.last_decision.selected_pool"},
+            tvl=tvl,
+            bin_step_bps=bin_step_bps,
+            base_fee_pct=base_fee_pct,
+            dynamic_fee_pct=dynamic_fee_pct,
+            is_blacklisted=False,
         )
+        return [fallback_pool]
 
     def _scoring_uses_exact_objective(self) -> bool:
         return (
