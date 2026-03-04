@@ -9,5 +9,3 @@ build/
 *.egg-info/
 state/
 executors/meteora_ts/node_modules/
-executors/meteora_ts/package-lock.json
-

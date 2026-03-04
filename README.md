@@ -97,7 +97,7 @@ The Python app is the primary project; Meteora execution is delegated to the off
 
 ```bash
 cd executors/meteora_ts
-npm install
+npm ci --omit=dev
 ```
 
 2. Configure in `.env`:

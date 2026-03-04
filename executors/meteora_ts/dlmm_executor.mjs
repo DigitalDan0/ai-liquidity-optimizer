@@ -1,4 +1,4 @@
-import DLMM, { StrategyType } from "@meteora-ag/dlmm";
+import { createRequire } from "node:module";
 import bs58 from "bs58";
 import BN from "bn.js";
 import {
@@ -9,6 +9,11 @@ import {
   VersionedTransaction,
   sendAndConfirmTransaction
 } from "@solana/web3.js";
+
+const require = createRequire(import.meta.url);
+const dlmmModule = require("@meteora-ag/dlmm");
+const DLMM = dlmmModule.default || dlmmModule;
+const { StrategyType } = dlmmModule;
 
 const RPC_FETCH_MAX_ATTEMPTS = parseEnvInt("RPC_FETCH_MAX_ATTEMPTS", 12, 1, 50);
 const RPC_FETCH_BASE_DELAY_MS = parseEnvInt("RPC_FETCH_BASE_DELAY_MS", 500, 50, 30000);
