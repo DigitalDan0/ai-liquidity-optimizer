@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ai_liquidity_optimizer.http import JsonHttpClient
 from ai_liquidity_optimizer.models import MeteoraPoolSnapshot
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MeteoraDlmmApiClient:
@@ -12,6 +16,7 @@ class MeteoraDlmmApiClient:
     def __init__(self, base_url: str, http_client: JsonHttpClient | None = None):
         self.base_url = base_url.rstrip("/")
         self.http = http_client or JsonHttpClient()
+        self._pool_cache_by_address: dict[str, MeteoraPoolSnapshot] = {}
 
     def list_pools(
         self,
@@ -38,14 +43,40 @@ class MeteoraDlmmApiClient:
     def get_pool(self, pool_address: str) -> MeteoraPoolSnapshot:
         payload = self.http.get_json(f"{self.base_url}/pools/{pool_address}", headers=_meteora_headers())
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            return self._parse_pool(payload["data"])
+            pool = self._parse_pool(payload["data"])
+            self._pool_cache_by_address[pool.address] = pool
+            return pool
         if isinstance(payload, dict):
-            return self._parse_pool(payload)
+            pool = self._parse_pool(payload)
+            self._pool_cache_by_address[pool.address] = pool
+            return pool
         raise RuntimeError("Unexpected Meteora pool response format")
 
     def find_sol_usdc_pool(self, pool_address: str | None = None, query: str = "SOL/USDC") -> MeteoraPoolSnapshot:
         if pool_address:
-            pool = self.get_pool(pool_address)
+            configured_address = str(pool_address)
+            try:
+                pool = self.get_pool(configured_address)
+            except Exception as exc:
+                cached = self._pool_cache_by_address.get(configured_address)
+                if cached is not None:
+                    LOGGER.warning(
+                        "Failed to refresh configured pool %s from Meteora API; reusing cached snapshot: %s",
+                        configured_address,
+                        exc,
+                    )
+                    return cached
+                fallback = self._find_pool_by_address_via_listing(configured_address=configured_address, query=query)
+                if fallback is not None:
+                    LOGGER.warning(
+                        "Failed to fetch configured pool %s directly; using listing fallback snapshot",
+                        configured_address,
+                    )
+                    self._pool_cache_by_address[fallback.address] = fallback
+                    return fallback
+                raise RuntimeError(
+                    f"Configured pool {configured_address} fetch failed and no fallback snapshot is available: {exc}"
+                ) from exc
             if not _is_sol_usdc_pair(pool):
                 raise RuntimeError(f"Configured pool {pool_address} is not SOL/USDC according to Meteora API")
             return pool
@@ -85,6 +116,24 @@ class MeteoraDlmmApiClient:
 
         filtered.sort(key=lambda p: (p.tvl_usd(), p.volume_24h), reverse=True)
         return filtered
+
+    def _find_pool_by_address_via_listing(
+        self,
+        *,
+        configured_address: str,
+        query: str,
+    ) -> MeteoraPoolSnapshot | None:
+        for list_query in (query, "SOL"):
+            try:
+                pools = self.list_pools(query=list_query, per_page=200)
+            except Exception:
+                continue
+            for pool in pools:
+                if pool.address == configured_address:
+                    if not _is_sol_usdc_pair(pool):
+                        return None
+                    return pool
+        return None
 
     def _parse_pool(self, raw: dict[str, Any]) -> MeteoraPoolSnapshot:
         token_x = raw.get("mint_x") or raw.get("token_x") or {}
