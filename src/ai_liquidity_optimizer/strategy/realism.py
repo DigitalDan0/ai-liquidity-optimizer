@@ -99,6 +99,18 @@ def _weighted_rmse(values: list[float], weights: list[float]) -> float | None:
     return math.sqrt(mse)
 
 
+def _bool_or_none(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    return None
+
+
 @dataclass(slots=True)
 class CalibrationSnapshot:
     fee_realism_multiplier: float
@@ -108,6 +120,9 @@ class CalibrationSnapshot:
     fee_sample_count: int
     rebalance_sample_count: int
     mode: str
+    regime_label: str | None = None
+    regime_sample_count: int = 0
+    global_sample_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,6 +133,9 @@ class CalibrationSnapshot:
             "fee_sample_count": self.fee_sample_count,
             "rebalance_sample_count": self.rebalance_sample_count,
             "mode": self.mode,
+            "regime_label": self.regime_label,
+            "regime_sample_count": self.regime_sample_count,
+            "global_sample_count": self.global_sample_count,
         }
 
 
@@ -145,6 +163,9 @@ def default_calibration_snapshot(
         fee_sample_count=0,
         rebalance_sample_count=0,
         mode="warmup",
+        regime_label=None,
+        regime_sample_count=0,
+        global_sample_count=0,
     )
 
 
@@ -159,6 +180,7 @@ def build_calibration_snapshot_from_journal(
     rebalance_drag_prior_usd: float,
     rebalance_drag_min_usd: float,
     rebalance_drag_max_usd: float,
+    regime_label: str | None = None,
     now: datetime | None = None,
 ) -> CalibrationSnapshot:
     snapshot = default_calibration_snapshot(
@@ -188,6 +210,8 @@ def build_calibration_snapshot_from_journal(
                     continue
                 if str(row.get("event_type") or "") != "decision":
                     continue
+                if regime_label and str(row.get("market_regime") or "") != str(regime_label):
+                    continue
                 ts = _parse_timestamp(row.get("decision_timestamp")) or _parse_timestamp(row.get("recorded_at"))
                 if ts is None or ts < cutoff:
                     continue
@@ -205,12 +229,34 @@ def build_calibration_snapshot_from_journal(
     rebalance_drags: list[float] = []
 
     for _ts, row in rows:
-        expected_net = _float_or_none(row.get("selected_expected_net_usd"))
-        realized_net = _float_or_none(row.get("onchain_delta_total_usd_est"))
+        execution_status = str(row.get("execution_status") or "").strip().lower()
+        calibration_enabled = _bool_or_none(row.get("calibration_enabled_row"))
+        if calibration_enabled is False:
+            continue
+        if execution_status and execution_status != "success":
+            # Realism calibration should only learn from execution outcomes.
+            continue
+
+        expected_net = _float_or_none(row.get("calibration_model_net_usd"))
+        if expected_net is None:
+            expected_net = _float_or_none(row.get("selected_raw_expected_net_usd"))
+        if expected_net is None:
+            expected_net = _float_or_none(row.get("selected_expected_net_usd"))
+
+        realized_net = _float_or_none(row.get("calibration_realized_net_usd"))
+        if realized_net is None:
+            realized_net = _float_or_none(row.get("execution_realized_delta_total_usd_est"))
+        if realized_net is None and execution_status == "success":
+            # Backward compatibility for older journal rows before explicit fields.
+            realized_net = _float_or_none(row.get("onchain_delta_total_usd_est"))
         if expected_net is None or realized_net is None:
             continue
         selected_action = str(row.get("selected_action") or "")
-        is_rebalance_row = bool(row.get("rebalance_should")) or selected_action == "rebalance"
+        is_rebalance_row = (
+            bool(row.get("execution_attempted"))
+            or bool(row.get("rebalance_should"))
+            or selected_action in {"rebalance", "idle"}
+        )
         residual = expected_net - realized_net
         residual_rows.append((expected_net, realized_net, residual, is_rebalance_row))
 
@@ -272,4 +318,59 @@ def build_calibration_snapshot_from_journal(
         fee_sample_count=fee_sample_count,
         rebalance_sample_count=rebalance_sample_count,
         mode="ready" if sample_count >= int(min_samples) else "warmup",
+        regime_label=regime_label,
+        regime_sample_count=sample_count,
+        global_sample_count=sample_count,
     )
+
+
+def blend_calibration_snapshots(
+    *,
+    prior_snapshot: CalibrationSnapshot,
+    global_snapshot: CalibrationSnapshot,
+    regime_snapshot: CalibrationSnapshot | None,
+    regime_min_samples: int,
+    regime_blend_max: float,
+) -> CalibrationSnapshot:
+    if regime_snapshot is None or regime_snapshot.sample_count <= 0 or not regime_snapshot.regime_label:
+        return global_snapshot
+
+    blended = CalibrationSnapshot(
+        fee_realism_multiplier=float(global_snapshot.fee_realism_multiplier),
+        rebalance_drag_usd=float(global_snapshot.rebalance_drag_usd),
+        model_rmse_usd=float(global_snapshot.model_rmse_usd),
+        sample_count=int(global_snapshot.sample_count),
+        fee_sample_count=int(global_snapshot.fee_sample_count),
+        rebalance_sample_count=int(global_snapshot.rebalance_sample_count),
+        mode=global_snapshot.mode,
+        regime_label=regime_snapshot.regime_label,
+        regime_sample_count=int(regime_snapshot.sample_count),
+        global_sample_count=int(global_snapshot.sample_count),
+    )
+    regime_count = int(regime_snapshot.sample_count)
+    if regime_count < int(regime_min_samples):
+        blended.rebalance_drag_usd = float(prior_snapshot.rebalance_drag_usd) + (
+            0.25 * (float(global_snapshot.rebalance_drag_usd) - float(prior_snapshot.rebalance_drag_usd))
+        )
+        blended.mode = "regime_warmup"
+        return blended
+
+    regime_weight = min(
+        max(float(regime_blend_max), 0.0),
+        float(regime_blend_max) * min(1.0, float(regime_count) / max(float(regime_min_samples * 2), 1.0)),
+    )
+    global_weight = max(0.0, 1.0 - regime_weight)
+    blended.fee_realism_multiplier = (
+        global_weight * float(global_snapshot.fee_realism_multiplier)
+        + regime_weight * float(regime_snapshot.fee_realism_multiplier)
+    )
+    blended.rebalance_drag_usd = (
+        global_weight * float(global_snapshot.rebalance_drag_usd)
+        + regime_weight * float(regime_snapshot.rebalance_drag_usd)
+    )
+    blended.model_rmse_usd = (
+        global_weight * float(global_snapshot.model_rmse_usd)
+        + regime_weight * float(regime_snapshot.model_rmse_usd)
+    )
+    blended.mode = "regime_ready"
+    return blended

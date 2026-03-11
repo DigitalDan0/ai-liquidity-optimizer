@@ -8,11 +8,13 @@ from ai_liquidity_optimizer.models import MeteoraPoolSnapshot, ScoredCandidate, 
 
 def horizon_to_minutes(horizon: str) -> int:
     text = horizon.strip().lower()
-    m = re.fullmatch(r"(\d+)([hd])", text)
+    m = re.fullmatch(r"(\d+)([mhd])", text)
     if not m:
-        raise ValueError(f"Unsupported horizon format: {horizon!r} (expected like '24h' or '7d')")
+        raise ValueError(f"Unsupported horizon format: {horizon!r} (expected like '15m', '24h', or '7d')")
     qty = int(m.group(1))
     unit = m.group(2)
+    if unit == "m":
+        return qty
     return qty * (60 if unit == "h" else 24 * 60)
 
 

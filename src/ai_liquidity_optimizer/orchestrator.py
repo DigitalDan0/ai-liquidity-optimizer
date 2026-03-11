@@ -5,6 +5,7 @@ import logging
 import time
 import traceback
 from datetime import datetime, timezone
+from datetime import timedelta
 from statistics import median
 from typing import Any
 
@@ -21,7 +22,9 @@ from ai_liquidity_optimizer.models import (
     ExecutionApplyRequest,
     ExecutorRangeBinQuote,
     MeteoraPoolSnapshot,
+    ScenarioEvBreakdown,
     SynthLpBoundForecast,
+    SynthMarketState,
     WeightedBinPlan,
     utc_now_iso,
 )
@@ -31,11 +34,18 @@ from ai_liquidity_optimizer.strategy.bin_weights import (
     compute_exact_sdk_bin_odds_weight_plan,
     derive_mvp_bin_edges_for_range,
 )
-from ai_liquidity_optimizer.strategy.ev import EvLpScorer, median_bin_step_bps, median_width_pct
+from ai_liquidity_optimizer.strategy.ev import EvLpScorer, clamp, median_bin_step_bps, median_width_pct
 from ai_liquidity_optimizer.strategy.realism import (
     CalibrationSnapshot,
+    blend_calibration_snapshots,
     build_calibration_snapshot_from_journal,
     default_calibration_snapshot,
+)
+from ai_liquidity_optimizer.strategy.synth_market import (
+    SynthFusionConfig,
+    build_synthetic_forecasts_from_prediction_percentiles,
+    build_candidate_ladder,
+    build_synth_market_state,
 )
 from ai_liquidity_optimizer.strategy.scoring import StrategyScorer, relative_range_change_bps
 
@@ -263,23 +273,11 @@ class OptimizerOrchestrator:
         if not pools:
             raise RuntimeError("No eligible SOL/USDC Meteora pools after filtering")
 
-        forecasts = self.synth_client.get_lp_bounds(
-            asset=self.settings.synth_asset,
-            horizon=self.settings.synth_horizon,
-            days=self.settings.synth_days,
-            limit=self.settings.synth_limit,
-        )
-        lp_probabilities = self.synth_client.get_lp_probabilities(
-            asset=self.settings.synth_asset,
-            horizon=self.settings.synth_horizon,
-            days=self.settings.synth_days,
-        )
-
-        prediction_percentiles = None
-        try:
-            prediction_percentiles = self.synth_client.get_prediction_percentiles(asset=self.settings.synth_asset)
-        except Exception as exc:  # pragma: no cover - optional path endpoint
-            LOGGER.warning("prediction-percentiles unavailable; EV occupancy will use fallbacks: %s", exc)
+        forecasts_by_horizon, probabilities_by_horizon, prediction_percentiles = self._load_synth_market_inputs()
+        forecasts = forecasts_by_horizon.get(self.settings.synth_horizon) or []
+        lp_probabilities = probabilities_by_horizon.get(self.settings.synth_horizon)
+        if not forecasts or lp_probabilities is None:
+            raise RuntimeError(f"Missing Synth inputs for primary horizon={self.settings.synth_horizon}")
 
         pre_scores = self.ev_scorer.pool_pre_rank(pools, limit=self.settings.pool_candidate_limit)
         pre_score_by_addr = {p.pool_address: p for p in pre_scores}
@@ -287,6 +285,12 @@ class OptimizerOrchestrator:
         if not pruned_pools:
             pruned_pools = pools[: self.settings.pool_candidate_limit]
         pruned_pools.sort(key=lambda p: pre_score_by_addr.get(p.address).score if p.address in pre_score_by_addr else -1.0, reverse=True)
+        representative_pool = pruned_pools[0]
+        market_state = self._build_synth_market_state(
+            representative_pool=representative_pool,
+            forecasts_by_horizon=forecasts_by_horizon,
+            prediction_percentiles=prediction_percentiles,
+        )
 
         cost_model_info = self._apply_tx_cost_model(pools=pruned_pools)
 
@@ -362,9 +366,59 @@ class OptimizerOrchestrator:
             else:
                 scoring_objective_used = "hybrid_fallback"
 
-        realism_snapshot = self._build_realism_snapshot()
+        market_candidates: list[EvScoredCandidate] = []
+        if market_state is not None:
+            candidate_ladder = build_candidate_ladder(market_state)
+            for pool in pruned_pools:
+                for family, forecast in candidate_ladder:
+                    try:
+                        weighted_bin_plan = self._compute_weighted_bin_plan(
+                            pool=pool,
+                            lower=forecast.lower_bound,
+                            upper=forecast.upper_bound,
+                            forecast=forecast,
+                            lp_probabilities=lp_probabilities,
+                            prediction_percentiles=prediction_percentiles,
+                        )
+                        market_candidate = self.ev_scorer.score_pool_range_ev_15m(
+                            pool=pool,
+                            forecast=forecast,
+                            weighted_bin_plan=weighted_bin_plan,
+                            synth_horizon=self.settings.synth_horizon,
+                            prediction_percentiles=prediction_percentiles,
+                            deposit_sol_amount=self.settings.deposit_sol_amount,
+                            deposit_usdc_amount=self.settings.deposit_usdc_amount,
+                            width_ref_pct=width_ref_pct,
+                            bin_step_ref_bps=bin_step_ref_bps,
+                            active_position=state.active_position,
+                            range_change_threshold_bps=self.settings.range_change_threshold_bps,
+                            apply_rebalance_costs=True,
+                            pre_rank_score=pre_score_by_addr.get(pool.address).score if pool.address in pre_score_by_addr else None,
+                            action_type="rebalance",
+                        )
+                        market_candidate.candidate_family = family
+                        market_candidate.market_regime = market_state.market_regime
+                        self._apply_scenario_adjustments(candidate=market_candidate, market_state=market_state)
+                        market_candidates.append(market_candidate)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "Skipping market-state candidate family=%s pool=%s range=%.4f-%.4f due to error: %s",
+                            family,
+                            pool.address,
+                            forecast.lower_bound,
+                            forecast.upper_bound,
+                            exc,
+                        )
+
+        realism_snapshot = self._build_realism_snapshot(market_state=market_state)
         use_adjusted_for_decisions = bool(self.settings.ev_realism_enabled) and not bool(self.settings.ev_realism_shadow_mode)
         for candidate in ev_candidates:
+            self._apply_realism_adjustments(
+                candidate=candidate,
+                snapshot=realism_snapshot,
+                apply_to_decision=use_adjusted_for_decisions,
+            )
+        for candidate in market_candidates:
             self._apply_realism_adjustments(
                 candidate=candidate,
                 snapshot=realism_snapshot,
@@ -379,7 +433,15 @@ class OptimizerOrchestrator:
             ),
             reverse=True,
         )
-        best = ev_candidates[0]
+        market_candidates.sort(
+            key=lambda c: (
+                self._candidate_effective_ev(c, use_adjusted=use_adjusted_for_decisions),
+                c.ev_components.active_occupancy_15m,
+                -c.forecast.width_pct,
+            ),
+            reverse=True,
+        )
+        best = market_candidates[0] if (self._synth_market_stage_allows_full() and market_candidates) else ev_candidates[0]
         selected_pool = pools_by_address.get(best.pool_address)
         if selected_pool is None:
             selected_pool = self.meteora_client.get_pool(best.pool_address)
@@ -415,6 +477,10 @@ class OptimizerOrchestrator:
         pre_onchain_snapshot, pre_onchain_delta = self._capture_onchain_snapshot(
             state=state,
             pool=active_pool_for_snapshot,
+        )
+        untracked_pool_positions_count = self._extract_untracked_pool_position_count(
+            state=state,
+            onchain_snapshot=pre_onchain_snapshot,
         )
         lifecycle_metrics = self._update_position_lifecycle_state(
             state=state,
@@ -459,9 +525,86 @@ class OptimizerOrchestrator:
             hold_oor_cycles=hold_oor_cycles,
             action_cooldown_remaining=action_cooldown_remaining,
             lifecycle_metrics=lifecycle_metrics,
+            market_state=market_state,
             use_adjusted_ev=use_adjusted_for_decisions,
             effective_min_delta_usd=effective_min_delta_usd,
         )
+        rebalance_gate["untracked_pool_positions_count"] = untracked_pool_positions_count
+        execution_health = self._recent_executor_health()
+        size_multiplier = 1.0
+        if market_state is not None and self._synth_market_stage_allows_entry_size():
+            size_multiplier = float(market_state.size_multiplier)
+        capital_check = self._entry_capital_check(
+            onchain_snapshot=pre_onchain_snapshot,
+            size_multiplier=size_multiplier,
+        )
+        rebalance_gate["market_state_stage"] = self._synth_market_stage()
+        rebalance_gate["size_multiplier"] = size_multiplier
+        rebalance_gate["execution_health"] = execution_health
+        rebalance_gate["entry_capital_check"] = capital_check
+        if (
+            state.active_position is None
+            and should_rebalance
+            and untracked_pool_positions_count is not None
+            and untracked_pool_positions_count > 0
+        ):
+            selected_action = "idle"
+            should_rebalance = False
+            should_close_to_idle = False
+            reason = f"idle_blocked_untracked_positions_{int(untracked_pool_positions_count)}"
+            rebalance_gate["selected_action"] = "idle"
+            rebalance_gate["idle_open_blocked_untracked_positions"] = True
+            # Force reconfirmation later rather than retrying opens every cycle while orphan positions exist.
+            state.strategy_state["idle_exit_confirm_count"] = 0
+        if state.active_position is None and should_rebalance and bool(execution_health.get("blocked")):
+            selected_action = "idle"
+            should_rebalance = False
+            should_close_to_idle = False
+            reason = "idle_blocked_executor_health"
+            rebalance_gate["selected_action"] = "idle"
+            rebalance_gate["idle_open_blocked_executor_health"] = True
+            state.strategy_state["idle_exit_confirm_count"] = 0
+        if (
+            state.active_position is None
+            and should_rebalance
+            and self._synth_market_stage_allows_entry_size()
+            and market_state is not None
+        ):
+            if size_multiplier <= 0.0:
+                selected_action = "idle"
+                should_rebalance = False
+                should_close_to_idle = False
+                reason = "idle_blocked_size_zero"
+                rebalance_gate["selected_action"] = "idle"
+                rebalance_gate["idle_open_blocked_size_zero"] = True
+                state.strategy_state["idle_exit_confirm_count"] = 0
+            elif market_state.short_medium_conflict_score >= float(self.settings.synth_entry_conflict_threshold):
+                selected_action = "idle"
+                should_rebalance = False
+                should_close_to_idle = False
+                reason = "idle_blocked_horizon_conflict"
+                rebalance_gate["selected_action"] = "idle"
+                rebalance_gate["idle_open_blocked_horizon_conflict"] = True
+                state.strategy_state["idle_exit_confirm_count"] = 0
+            elif (
+                market_state.market_regime == "uncertain"
+                and market_state.width_term_expansion >= float(self.settings.synth_regime_uncertain_width_expansion)
+            ):
+                selected_action = "idle"
+                should_rebalance = False
+                should_close_to_idle = False
+                reason = "idle_blocked_uncertain_expansion"
+                rebalance_gate["selected_action"] = "idle"
+                rebalance_gate["idle_open_blocked_uncertain_expansion"] = True
+                state.strategy_state["idle_exit_confirm_count"] = 0
+            elif not bool(capital_check.get("ok")):
+                selected_action = "idle"
+                should_rebalance = False
+                should_close_to_idle = False
+                reason = "idle_blocked_capital_precheck"
+                rebalance_gate["selected_action"] = "idle"
+                rebalance_gate["idle_open_blocked_capital_precheck"] = True
+                state.strategy_state["idle_exit_confirm_count"] = 0
         state.strategy_state["protective_breach_count"] = 0 if should_rebalance else protective_breach_count
 
         best_raw_ev = self._candidate_raw_ev(best)
@@ -473,8 +616,9 @@ class OptimizerOrchestrator:
                 "EV best pool=%s spot=%.4f range=%.4f-%.4f "
                 "EVraw=$%.4f EVadj=%s "
                 "(fees_raw=$%.4f fees_adj=%s il=$%.4f[base=$%.4f pen=$%.4f] costs=$%.4f%s drag=%s unc=%s occ_range=%.3f align=%s util=%s capture=%s conc=%.3f src=%s) "
-                "active_range=%s hold_raw=%s hold_adj=%s hold_util=%s hold_out_bps=%s hold_oor_cycles=%s hold_exact_bounds=%s "
+                "active_range=%s untracked_pool_positions=%s hold_raw=%s hold_adj=%s hold_util=%s hold_out_bps=%s hold_oor_cycles=%s hold_exact_bounds=%s "
                 "lifecycle_pnl=%s lifecycle_pct=%s policy=%s "
+                "stage=%s regime=%s reg_conf=%s agree=%s size=%s family=%s re15=%s re1h=%s "
                 "delta=%s min_delta_eff=%s cal=%s/%s action=%s gate=%s breach=%s rebalance=%s close_idle=%s (%s)"
             ),
             best.pool_name,
@@ -507,6 +651,11 @@ class OptimizerOrchestrator:
                 if state.active_position is not None
                 else "n/a"
             ),
+            (
+                str(int(untracked_pool_positions_count))
+                if untracked_pool_positions_count is not None
+                else "n/a"
+            ),
             f"${hold_raw_ev:.4f}" if hold_raw_ev is not None else "n/a",
             f"${hold_adjusted_ev:.4f}" if hold_adjusted_ev is not None else "n/a",
             f"{ev_current_hold.ev_components.utilization_ratio:.3f}"
@@ -528,6 +677,14 @@ class OptimizerOrchestrator:
             if lifecycle_metrics.get("lifecycle_pnl_pct") is not None
             else "n/a",
             rebalance_gate.get("policy_selected_override", "none"),
+            self._synth_market_stage(),
+            market_state.market_regime if market_state is not None else "n/a",
+            f"{market_state.regime_confidence:.3f}" if market_state is not None else "n/a",
+            f"{market_state.horizon_agreement_score:.3f}" if market_state is not None else "n/a",
+            f"{size_multiplier:.2f}",
+            best.candidate_family or best.action_type,
+            f"{market_state.reentry_prob_15m:.3f}" if market_state and market_state.reentry_prob_15m is not None else "n/a",
+            f"{market_state.reentry_prob_1h:.3f}" if market_state and market_state.reentry_prob_1h is not None else "n/a",
             f"${ev_delta_usd:.4f}" if ev_delta_usd is not None else "n/a",
             f"${effective_min_delta_usd:.4f}",
             realism_snapshot.sample_count,
@@ -578,8 +735,8 @@ class OptimizerOrchestrator:
                         target_forecast=best.forecast,
                         target_lower_price=best.forecast.lower_bound,
                         target_upper_price=best.forecast.upper_bound,
-                        deposit_sol_amount=self.settings.deposit_sol_amount,
-                        deposit_usdc_amount=self.settings.deposit_usdc_amount,
+                        deposit_sol_amount=self.settings.deposit_sol_amount * size_multiplier,
+                        deposit_usdc_amount=self.settings.deposit_usdc_amount * size_multiplier,
                         existing_position=state.active_position,
                         target_bin_ids=execution_bin_quote.bin_ids if execution_bin_quote else None,
                         target_bin_edges=execution_bin_weight_plan.bin_edges if execution_bin_weight_plan else best.weighted_bin_plan.bin_edges,
@@ -626,6 +783,7 @@ class OptimizerOrchestrator:
             ev_current_hold=ev_current_hold,
             ev_delta_usd=ev_delta_usd,
             ev_candidates=ev_candidates,
+            market_candidates=market_candidates,
             pre_scores=pre_scores,
             rebalance_gate=rebalance_gate,
             should_rebalance=should_rebalance,
@@ -645,6 +803,9 @@ class OptimizerOrchestrator:
             onchain_snapshot=onchain_snapshot,
             onchain_delta=onchain_delta,
             realism_snapshot=realism_snapshot,
+            market_state=market_state,
+            size_multiplier=size_multiplier,
+            execution_health=execution_health,
             use_adjusted_for_decisions=use_adjusted_for_decisions,
             effective_min_delta_usd=effective_min_delta_usd,
         )
@@ -955,8 +1116,8 @@ class OptimizerOrchestrator:
         info["source"] = "fixed_lamports"
         return info
 
-    def _build_realism_snapshot(self) -> CalibrationSnapshot:
-        snapshot = default_calibration_snapshot(
+    def _build_realism_snapshot(self, *, market_state: SynthMarketState | None = None) -> CalibrationSnapshot:
+        prior_snapshot = default_calibration_snapshot(
             fee_realism_prior=float(self.settings.ev_fee_realism_prior),
             fee_realism_min=float(self.settings.ev_fee_realism_min),
             fee_realism_max=float(self.settings.ev_fee_realism_max),
@@ -965,9 +1126,9 @@ class OptimizerOrchestrator:
             rebalance_drag_max_usd=float(self.settings.ev_rebalance_drag_max_usd),
         )
         if not bool(self.settings.ev_realism_enabled):
-            return snapshot
+            return prior_snapshot
         try:
-            return build_calibration_snapshot_from_journal(
+            global_snapshot = build_calibration_snapshot_from_journal(
                 journal_path=self.settings.trade_journal_path,
                 window_hours=int(self.settings.ev_realism_window_hours),
                 min_samples=int(self.settings.ev_realism_min_samples),
@@ -978,9 +1139,288 @@ class OptimizerOrchestrator:
                 rebalance_drag_min_usd=float(self.settings.ev_rebalance_drag_min_usd),
                 rebalance_drag_max_usd=float(self.settings.ev_rebalance_drag_max_usd),
             )
+            if market_state is None or not market_state.market_regime:
+                return global_snapshot
+            regime_snapshot = build_calibration_snapshot_from_journal(
+                journal_path=self.settings.trade_journal_path,
+                window_hours=int(self.settings.ev_realism_window_hours),
+                min_samples=int(self.settings.ev_realism_min_samples),
+                fee_realism_prior=float(self.settings.ev_fee_realism_prior),
+                fee_realism_min=float(self.settings.ev_fee_realism_min),
+                fee_realism_max=float(self.settings.ev_fee_realism_max),
+                rebalance_drag_prior_usd=float(self.settings.ev_rebalance_drag_prior_usd),
+                rebalance_drag_min_usd=float(self.settings.ev_rebalance_drag_min_usd),
+                rebalance_drag_max_usd=float(self.settings.ev_rebalance_drag_max_usd),
+                regime_label=market_state.market_regime,
+            )
+            return blend_calibration_snapshots(
+                prior_snapshot=prior_snapshot,
+                global_snapshot=global_snapshot,
+                regime_snapshot=regime_snapshot,
+                regime_min_samples=int(self.settings.ev_realism_regime_min_samples),
+                regime_blend_max=float(self.settings.ev_realism_regime_blend_max),
+            )
         except Exception as exc:
             LOGGER.warning("Realism calibration failed; using priors: %s", exc)
-            return snapshot
+            return prior_snapshot
+
+    def _load_synth_market_inputs(
+        self,
+    ) -> tuple[dict[str, list[SynthLpBoundForecast]], dict[str, Any], Any]:
+        horizons: list[str] = []
+        for horizon in [self.settings.synth_horizon] + list(self.settings.synth_fusion_horizons):
+            if horizon not in horizons:
+                horizons.append(horizon)
+
+        forecasts_by_horizon: dict[str, list[SynthLpBoundForecast]] = {}
+        probabilities_by_horizon: dict[str, Any] = {}
+        prediction_percentiles = None
+        try:
+            prediction_percentiles = self.synth_client.get_prediction_percentiles(asset=self.settings.synth_asset)
+        except Exception as exc:  # pragma: no cover - optional path endpoint
+            LOGGER.warning("prediction-percentiles unavailable; EV occupancy will use fallbacks: %s", exc)
+
+        for horizon in horizons:
+            if horizon == "15m" and prediction_percentiles is not None:
+                synthetic_forecasts = build_synthetic_forecasts_from_prediction_percentiles(
+                    prediction_percentiles=prediction_percentiles,
+                    horizon_minutes=15,
+                    current_price=prediction_percentiles.current_price,
+                )
+                if synthetic_forecasts:
+                    forecasts_by_horizon[horizon] = synthetic_forecasts
+                    probabilities_by_horizon[horizon] = None
+                    LOGGER.info(
+                        "Synthesized %d forecasts for optional Synth horizon=%s from prediction percentiles",
+                        len(synthetic_forecasts),
+                        horizon,
+                    )
+                    continue
+            try:
+                forecasts_by_horizon[horizon] = self.synth_client.get_lp_bounds(
+                    asset=self.settings.synth_asset,
+                    horizon=horizon,
+                    days=self.settings.synth_days,
+                    limit=self.settings.synth_limit,
+                )
+                probabilities_by_horizon[horizon] = self.synth_client.get_lp_probabilities(
+                    asset=self.settings.synth_asset,
+                    horizon=horizon,
+                    days=self.settings.synth_days,
+                )
+            except Exception as exc:
+                if horizon == self.settings.synth_horizon:
+                    raise
+                LOGGER.warning(
+                    "Skipping optional Synth horizon=%s due to fetch failure: %s",
+                    horizon,
+                    self._format_optional_synth_horizon_error(exc),
+                )
+
+        return forecasts_by_horizon, probabilities_by_horizon, prediction_percentiles
+
+    @staticmethod
+    def _is_unsupported_optional_synth_horizon_error(exc: Exception) -> bool:
+        message = str(exc or "").lower()
+        return "http error 400" in message or "400:" in message
+
+    @classmethod
+    def _format_optional_synth_horizon_error(cls, exc: Exception) -> str:
+        if cls._is_unsupported_optional_synth_horizon_error(exc):
+            return "endpoint rejected this horizon (continuing with supported horizons)"
+        return str(exc)
+
+    def _build_synth_market_state(
+        self,
+        *,
+        representative_pool: MeteoraPoolSnapshot,
+        forecasts_by_horizon: dict[str, list[SynthLpBoundForecast]],
+        prediction_percentiles,
+    ) -> SynthMarketState | None:
+        if self.ev_scorer is None:
+            return None
+        config = SynthFusionConfig(
+            horizons=list(self.settings.synth_fusion_horizons),
+            range_max_center_drift_ratio=float(self.settings.synth_regime_range_max_center_drift_ratio),
+            trend_min_center_drift_ratio=float(self.settings.synth_regime_trend_min_center_drift_ratio),
+            trend_min_onesided_prob=float(self.settings.synth_regime_trend_min_onesided_prob),
+            min_agreement_score=float(self.settings.synth_regime_min_agreement_score),
+            uncertain_width_expansion=float(self.settings.synth_regime_uncertain_width_expansion),
+            entry_conflict_threshold=float(self.settings.synth_entry_conflict_threshold),
+            size_low_confidence=float(self.settings.synth_size_low_confidence),
+            size_medium_confidence=float(self.settings.synth_size_medium_confidence),
+            size_full_confidence=float(self.settings.synth_size_full_confidence),
+        )
+        try:
+            return build_synth_market_state(
+                representative_pool=representative_pool,
+                forecasts_by_horizon=forecasts_by_horizon,
+                prediction_percentiles=prediction_percentiles,
+                scorer=self.scorer,
+                ev_scorer=self.ev_scorer,
+                config=config,
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to build Synth market state; continuing without it: %s", exc)
+            return None
+
+    def _synth_market_stage(self) -> str:
+        return str(getattr(self.settings, "synth_market_state_stage", "shadow") or "shadow").strip().lower()
+
+    def _synth_market_stage_allows_entry_size(self) -> bool:
+        return self._synth_market_stage() in {"entry_size", "full"}
+
+    def _synth_market_stage_allows_full(self) -> bool:
+        return self._synth_market_stage() == "full"
+
+    def _build_scenario_breakdown(
+        self,
+        *,
+        candidate: EvScoredCandidate,
+        market_state: SynthMarketState,
+    ) -> ScenarioEvBreakdown:
+        assert self.ev_scorer is not None
+        out_prob = float(candidate.ev_components.out_of_range_prob_15m or 0.0)
+        reentry_probability = self.ev_scorer.compute_recovery_probability(
+            range_active_occupancy_15m=float(
+                candidate.ev_components.range_active_occupancy_15m
+                if candidate.ev_components.range_active_occupancy_15m is not None
+                else candidate.ev_components.active_occupancy_15m
+            ),
+            one_sided_break_prob=float(candidate.ev_components.one_sided_break_prob or 0.0),
+            directional_confidence=float(candidate.ev_components.directional_confidence or 0.0),
+        )
+        exit_reenter_prob = clamp(out_prob * reentry_probability, 0.0, out_prob)
+        stay_prob = clamp(1.0 - out_prob, 0.0, 1.0)
+        breakout_remaining = clamp(out_prob - exit_reenter_prob, 0.0, 1.0)
+        spot = max(candidate.pool_current_price_sol_usdc, 1e-9)
+        signed_bps = ((candidate.forecast.mid_price - spot) / spot) * 10_000.0
+        width_bps = max(candidate.forecast.width_pct * 100.0, 1e-9)
+        direction_bias = clamp(0.5 + 0.5 * (signed_bps / width_bps), 0.0, 1.0)
+        if market_state.market_regime == "trend_up":
+            direction_bias = clamp(direction_bias + 0.15, 0.0, 1.0)
+        elif market_state.market_regime == "trend_down":
+            direction_bias = clamp(direction_bias - 0.15, 0.0, 1.0)
+        breakout_up_prob = breakout_remaining * direction_bias
+        breakout_down_prob = breakout_remaining * (1.0 - direction_bias)
+        expected_active_minutes_before_exit = float(self.settings.ev_horizon_minutes) * clamp(
+            stay_prob + (0.50 * exit_reenter_prob),
+            0.0,
+            1.0,
+        )
+        inventory_bias = breakout_up_prob - breakout_down_prob
+
+        return ScenarioEvBreakdown(
+            stay_prob=stay_prob,
+            exit_reenter_prob=exit_reenter_prob,
+            breakout_up_prob=breakout_up_prob,
+            breakout_down_prob=breakout_down_prob,
+            expected_active_minutes_before_exit=expected_active_minutes_before_exit,
+            reentry_probability=reentry_probability,
+            inventory_bias=inventory_bias,
+        )
+
+    def _apply_scenario_adjustments(
+        self,
+        *,
+        candidate: EvScoredCandidate,
+        market_state: SynthMarketState,
+    ) -> None:
+        scenario = self._build_scenario_breakdown(candidate=candidate, market_state=market_state)
+        breakout_total = scenario.breakout_up_prob + scenario.breakout_down_prob
+        fee_multiplier = clamp(1.0 - 0.35 * breakout_total - 0.12 * (1.0 - scenario.reentry_probability), 0.55, 1.05)
+        il_multiplier = clamp(1.0 + 0.60 * breakout_total - 0.15 * scenario.exit_reenter_prob, 0.85, 1.75)
+        original_fees = float(candidate.ev_components.expected_fees_usd)
+        original_il = float(candidate.ev_components.expected_il_usd)
+        candidate.ev_components.expected_fees_usd = original_fees * fee_multiplier
+        candidate.ev_components.expected_il_usd = original_il * il_multiplier
+        candidate.ev_components.scenario_stay_prob = scenario.stay_prob
+        candidate.ev_components.scenario_exit_reenter_prob = scenario.exit_reenter_prob
+        candidate.ev_components.scenario_breakout_up_prob = scenario.breakout_up_prob
+        candidate.ev_components.scenario_breakout_down_prob = scenario.breakout_down_prob
+        candidate.ev_components.expected_active_minutes_before_exit = scenario.expected_active_minutes_before_exit
+        candidate.ev_components.reentry_probability = scenario.reentry_probability
+        candidate.ev_components.inventory_bias = scenario.inventory_bias
+        candidate.scenario_breakdown = scenario
+        candidate.market_regime = market_state.market_regime
+        candidate.ev_15m_usd = self._candidate_raw_ev(candidate)
+
+    def _recent_executor_health(self) -> dict[str, Any]:
+        summary = {
+            "window_minutes": int(self.settings.execution_health_window_minutes),
+            "rpc_rate_limit_errors": 0,
+            "upstream_timeout_errors": 0,
+            "blocked": False,
+        }
+        path = self.settings.trade_journal_path
+        if not path.exists():
+            return summary
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=int(self.settings.execution_health_window_minutes))
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        row = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(row, dict) or str(row.get("event_type") or "") != "cycle_error":
+                        continue
+                    raw_ts = row.get("recorded_at")
+                    if not isinstance(raw_ts, str):
+                        continue
+                    ts_text = raw_ts[:-1] + "+00:00" if raw_ts.endswith("Z") else raw_ts
+                    try:
+                        ts = datetime.fromisoformat(ts_text)
+                    except ValueError:
+                        continue
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts.astimezone(timezone.utc) < cutoff:
+                        continue
+                    category = str(row.get("error_category") or "")
+                    if category == "rpc_rate_limit":
+                        summary["rpc_rate_limit_errors"] += 1
+                    elif category == "upstream_timeout":
+                        summary["upstream_timeout_errors"] += 1
+        except OSError:
+            return summary
+        summary["blocked"] = (
+            int(summary["rpc_rate_limit_errors"]) >= int(self.settings.execution_health_max_rpc_rate_limit_errors)
+            or int(summary["upstream_timeout_errors"]) >= int(self.settings.execution_health_max_upstream_timeout_errors)
+        )
+        return summary
+
+    def _entry_capital_check(
+        self,
+        *,
+        onchain_snapshot: dict[str, Any] | None,
+        size_multiplier: float,
+    ) -> dict[str, Any]:
+        required_sol = max(0.0, float(self.settings.deposit_sol_amount) * float(size_multiplier))
+        required_usdc = max(0.0, float(self.settings.deposit_usdc_amount) * float(size_multiplier))
+        available_sol = None
+        available_usdc = None
+        if isinstance(onchain_snapshot, dict):
+            available_sol = self._safe_float(onchain_snapshot.get("wallet_sol_total_balance"))
+            if available_sol is None:
+                available_sol = self._safe_float(onchain_snapshot.get("sol_balance"))
+            available_usdc = self._safe_float(onchain_snapshot.get("wallet_usdc_total_balance"))
+            if available_usdc is None:
+                available_usdc = self._safe_float(onchain_snapshot.get("usdc_balance"))
+        sol_ok = True if available_sol is None else available_sol >= max(0.0, required_sol - 1e-9)
+        usdc_ok = True if available_usdc is None else available_usdc >= max(0.0, required_usdc - 1e-9)
+        return {
+            "required_sol": required_sol,
+            "required_usdc": required_usdc,
+            "available_sol": available_sol,
+            "available_usdc": available_usdc,
+            "sol_ok": sol_ok,
+            "usdc_ok": usdc_ok,
+            "ok": bool(sol_ok and usdc_ok),
+        }
 
     @staticmethod
     def _candidate_raw_ev(candidate: EvScoredCandidate) -> float:
@@ -1337,6 +1777,7 @@ class OptimizerOrchestrator:
         hold_oor_cycles: int,
         action_cooldown_remaining: int,
         lifecycle_metrics: dict[str, Any] | None = None,
+        market_state: SynthMarketState | None = None,
         use_adjusted_ev: bool = False,
         effective_min_delta_usd: float | None = None,
     ) -> tuple[str, bool, bool, str, dict[str, Any], int, float, dict[str, float | None]]:
@@ -1665,6 +2106,75 @@ class OptimizerOrchestrator:
                     selected_protective_breach = protective_breach_count
                     policy_selected_override = "oor_reentry_hold"
 
+        if (
+            self._synth_market_stage_allows_full()
+            and market_state is not None
+            and ev_current_hold is not None
+            and state.active_position is not None
+        ):
+            active_lower = min(state.active_position.lower_price, state.active_position.upper_price)
+            active_upper = max(state.active_position.lower_price, state.active_position.upper_price)
+            short_state = market_state.horizons.get("15m") or next(iter(market_state.horizons.values()), None)
+            medium_state = market_state.horizons.get("1h") or short_state
+            reentry_short = float(market_state.reentry_prob_15m or 0.0)
+            if short_state is not None and medium_state is not None:
+                short_supportive = active_lower <= short_state.center_price <= active_upper
+                medium_supportive = active_lower <= medium_state.center_price <= active_upper
+                both_above = short_state.center_price > active_upper and medium_state.center_price > active_upper
+                both_below = short_state.center_price < active_lower and medium_state.center_price < active_lower
+                trend_away = (
+                    (both_above or both_below)
+                    and market_state.horizon_agreement_score >= float(self.settings.synth_regime_min_agreement_score)
+                )
+                synth_loss_trigger = (
+                    lifecycle_pnl_pct is not None
+                    and lifecycle_pnl_pct <= -max(
+                        float(self.settings.ev_loss_recovery_trigger_pct),
+                        float(self.settings.ev_oor_loss_trigger_pct),
+                    )
+                )
+                if (
+                    synth_loss_trigger
+                    and selected_action in {"rebalance", "idle"}
+                    and reentry_short >= float(self.settings.ev_oor_reentry_min_prob)
+                    and medium_supportive
+                ):
+                    selected_action = "hold"
+                    selected_should_rebalance = False
+                    selected_should_close_to_idle = False
+                    selected_reason = "synth_reentry_hold"
+                    selected_protective_breach = protective_breach_count
+                    policy_selected_override = "synth_reentry_hold"
+                elif (
+                    synth_loss_trigger
+                    and selected_action == "hold"
+                    and trend_away
+                    and reentry_short < float(self.settings.ev_oor_reentry_min_prob)
+                ):
+                    selected_action = "rebalance"
+                    selected_should_rebalance = True
+                    selected_should_close_to_idle = False
+                    selected_reason = "synth_trend_exit"
+                    selected_protective_breach = 0
+                    policy_selected_override = "synth_trend_exit"
+                elif (
+                    lifecycle_pnl_pct is not None
+                    and lifecycle_pnl_pct >= float(self.settings.ev_profit_take_pct)
+                    and selected_action == "hold"
+                    and bool(best.rebalance_structural_change)
+                ):
+                    short_alpha_decay = (
+                        short_state.probability_to_stay + 0.08 < medium_state.probability_to_stay
+                        or short_state.one_sided_break_prob > (medium_state.one_sided_break_prob + 0.08)
+                    )
+                    if short_alpha_decay:
+                        selected_action = "rebalance"
+                        selected_should_rebalance = True
+                        selected_should_close_to_idle = False
+                        selected_reason = "synth_profit_lock_rotate"
+                        selected_protective_breach = 0
+                        policy_selected_override = "profit_lock"
+
         adjusted_ev_positive_required = bool(getattr(self.settings, "ev_adjusted_ev_require_positive", True))
         adjusted_ev_positive_passed = True
         if (
@@ -1848,6 +2358,34 @@ class OptimizerOrchestrator:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _extract_untracked_pool_position_count(
+        cls,
+        *,
+        state: BotState,
+        onchain_snapshot: dict[str, Any] | None,
+    ) -> int | None:
+        if not isinstance(onchain_snapshot, dict):
+            return None
+        raw_count = (
+            onchain_snapshot.get("pool_other_position_count")
+            if state.active_position is not None
+            else onchain_snapshot.get("pool_user_position_count")
+        )
+        parsed = cls._safe_int(raw_count)
+        if parsed is None:
+            return None
+        return max(0, parsed)
+
     @classmethod
     def _extract_onchain_equity_values(cls, onchain_snapshot: dict[str, Any] | None) -> tuple[float | None, float | None]:
         if not isinstance(onchain_snapshot, dict):
@@ -1973,6 +2511,7 @@ class OptimizerOrchestrator:
         ev_current_hold: EvScoredCandidate | None,
         ev_delta_usd: float | None,
         ev_candidates: list[EvScoredCandidate],
+        market_candidates: list[EvScoredCandidate],
         pre_scores,
         rebalance_gate: dict[str, Any],
         should_rebalance: bool,
@@ -1992,6 +2531,9 @@ class OptimizerOrchestrator:
         onchain_snapshot: dict[str, Any] | None,
         onchain_delta: dict[str, Any] | None,
         realism_snapshot: CalibrationSnapshot,
+        market_state: SynthMarketState | None,
+        size_multiplier: float,
+        execution_health: dict[str, Any] | None,
         use_adjusted_for_decisions: bool,
         effective_min_delta_usd: float,
     ) -> dict[str, Any]:
@@ -2002,6 +2544,20 @@ class OptimizerOrchestrator:
         hold_adjusted_ev = ev_current_hold.ev_components.adjusted_ev_15m_usd if ev_current_hold else None
         idle_raw_ev = self._candidate_raw_ev(idle_candidate)
         idle_adjusted_ev = idle_candidate.ev_components.adjusted_ev_15m_usd
+        selected_candidate = (
+            best
+            if selected_action == "rebalance"
+            else (ev_current_hold if selected_action == "hold" and ev_current_hold is not None else idle_candidate)
+        )
+        selected_candidate_family = selected_candidate.candidate_family or selected_candidate.action_type
+        counterfactual_top_k = _collect_counterfactual_top_k(
+            primary_candidates=market_candidates or ev_candidates,
+            secondary_candidates=ev_candidates if market_candidates else [],
+            hold_candidate=ev_current_hold,
+            idle_candidate=idle_candidate,
+            use_adjusted=use_adjusted_for_decisions,
+            limit=5,
+        )
         chosen = {
             "width_pct": best.forecast.width_pct,
             "lower_bound": best.forecast.lower_bound,
@@ -2013,6 +2569,9 @@ class OptimizerOrchestrator:
             "ev_15m_usd": self._candidate_effective_ev(best, use_adjusted=use_adjusted_for_decisions),
             "raw_ev_15m_usd": best_raw_ev,
             "adjusted_ev_15m_usd": best_adjusted_ev,
+            "candidate_family": best.candidate_family,
+            "market_regime": best.market_regime or (market_state.market_regime if market_state else None),
+            "scenario_breakdown": best.scenario_breakdown.to_dict() if best.scenario_breakdown else None,
             "ev_components": best.ev_components.to_dict(),
         }
         pool_dict = {
@@ -2042,6 +2601,8 @@ class OptimizerOrchestrator:
             "execution_bin_weight_plan": execution_bin_weight_plan.to_dict() if execution_bin_weight_plan else None,
             "execution_bin_quote": execution_bin_quote.to_dict() if execution_bin_quote else None,
             "top_candidates": [_summarize_ev_candidate(c) for c in ev_candidates[:5]],
+            "market_top_candidates": [_summarize_ev_candidate(c) for c in market_candidates[:5]],
+            "counterfactual_top_k": counterfactual_top_k,
             "ev_best_candidate": best.to_dict(),
             "ev_current_hold": ev_current_hold.to_dict() if ev_current_hold else None,
             "ev_idle_candidate": idle_candidate.to_dict(),
@@ -2057,6 +2618,18 @@ class OptimizerOrchestrator:
             "lifecycle_open_total_usd": lifecycle_metrics.get("lifecycle_open_total_usd"),
             "lifecycle_current_position_usd": lifecycle_metrics.get("lifecycle_current_position_usd"),
             "lifecycle_current_total_usd": lifecycle_metrics.get("lifecycle_current_total_usd"),
+            "market_state_stage": self._synth_market_stage(),
+            "market_state": market_state.to_dict() if market_state else None,
+            "market_regime": market_state.market_regime if market_state else None,
+            "regime_confidence": market_state.regime_confidence if market_state else None,
+            "horizon_agreement_score": market_state.horizon_agreement_score if market_state else None,
+            "short_medium_conflict_score": market_state.short_medium_conflict_score if market_state else None,
+            "width_term_expansion": market_state.width_term_expansion if market_state else None,
+            "uncertainty_score": market_state.uncertainty_score if market_state else None,
+            "reentry_prob_15m": market_state.reentry_prob_15m if market_state else None,
+            "reentry_prob_1h": market_state.reentry_prob_1h if market_state else None,
+            "size_multiplier": size_multiplier,
+            "candidate_family": selected_candidate_family,
             "policy_profit_triggered": rebalance_gate.get("policy_profit_triggered"),
             "policy_loss_recovery_hold_triggered": rebalance_gate.get("policy_loss_recovery_hold_triggered"),
             "policy_loss_trend_cut_triggered": rebalance_gate.get("policy_loss_trend_cut_triggered"),
@@ -2088,6 +2661,7 @@ class OptimizerOrchestrator:
                 "use_adjusted_for_decisions": use_adjusted_for_decisions,
                 "snapshot": realism_snapshot.to_dict(),
             },
+            "execution_health": execution_health or {},
             "scoring_objective_used": scoring_objective_used,
             "rescored_candidate_count": rescored_candidate_count,
             "rebalance_gate": rebalance_gate,
@@ -2256,6 +2830,56 @@ class OptimizerOrchestrator:
             pass
         return delta
 
+    def _calibration_execution_outlier_reason(
+        self,
+        *,
+        model_net_usd: float,
+        realized_net_usd: float,
+        expected_fees_usd: float | None,
+        expected_il_usd: float | None,
+        expected_total_cost_usd: float | None,
+        snapshot_position_total_usd: float | None,
+        lifecycle_open_position_usd: float | None,
+    ) -> str | None:
+        def _first_positive(*values: float | None) -> float | None:
+            for value in values:
+                if value is not None and value > 0:
+                    return float(value)
+            return None
+
+        position_scale_usd = _first_positive(snapshot_position_total_usd, lifecycle_open_position_usd)
+        realized_abs = abs(float(realized_net_usd))
+        error_abs = abs(float(model_net_usd) - float(realized_net_usd))
+        max_realized_position_fraction = max(
+            1e-9,
+            float(getattr(self.settings, "ev_calibration_max_realized_position_fraction", 0.30)),
+        )
+        max_error_position_fraction = max(
+            1e-9,
+            float(getattr(self.settings, "ev_calibration_max_error_position_fraction", 0.30)),
+        )
+        max_error_model_scale_multiple = max(
+            1e-9,
+            float(getattr(self.settings, "ev_calibration_max_error_model_scale_multiple", 25.0)),
+        )
+        if position_scale_usd is not None:
+            if (realized_abs / position_scale_usd) > max_realized_position_fraction:
+                return "execution_outlier_vs_position_scale"
+            if (error_abs / position_scale_usd) > max_error_position_fraction:
+                return "execution_error_outlier_vs_position_scale"
+
+        model_scale_candidates = [abs(float(model_net_usd))]
+        for candidate in (expected_fees_usd, expected_il_usd, expected_total_cost_usd):
+            if candidate is not None:
+                try:
+                    model_scale_candidates.append(abs(float(candidate)))
+                except (TypeError, ValueError):
+                    continue
+        model_scale_usd = max((value for value in model_scale_candidates if value > 0), default=0.0)
+        if model_scale_usd > 0 and (error_abs / model_scale_usd) > max_error_model_scale_multiple:
+            return "execution_outlier_vs_model_scale"
+        return None
+
     def _append_trade_journal_decision_entry(self, *, result: dict[str, Any]) -> None:
         if not self.settings.trade_journal_enabled:
             return
@@ -2275,6 +2899,7 @@ class OptimizerOrchestrator:
         idle_components = idle.get("ev_components") if isinstance(idle.get("ev_components"), dict) else {}
         onchain_snapshot = result.get("onchain_snapshot") if isinstance(result.get("onchain_snapshot"), dict) else {}
         onchain_delta = result.get("onchain_delta") if isinstance(result.get("onchain_delta"), dict) else {}
+        counterfactual_top_k = result.get("counterfactual_top_k") if isinstance(result.get("counterfactual_top_k"), list) else []
         tx_signatures_raw = rebalance.get("tx_signatures")
         tx_signatures = [str(x) for x in tx_signatures_raw if isinstance(x, str)] if isinstance(tx_signatures_raw, list) else []
         should_rebalance = bool(rebalance.get("should_rebalance"))
@@ -2345,6 +2970,48 @@ class OptimizerOrchestrator:
             else:
                 execution_status = "attempted_no_tx"
 
+        onchain_delta_total_usd = self._safe_float(onchain_delta.get("delta_total_usd_est"))
+        onchain_delta_wallet_total_usd = self._safe_float(onchain_delta.get("delta_wallet_total_usd_est"))
+        onchain_delta_position_total_usd = self._safe_float(onchain_delta.get("delta_position_total_usd_est"))
+        onchain_delta_minutes = self._safe_float(onchain_delta.get("minutes_elapsed"))
+        onchain_delta_has_equity_components = (
+            onchain_delta_wallet_total_usd is not None or onchain_delta_position_total_usd is not None
+        )
+
+        execution_realized_delta_total_usd = onchain_delta_total_usd if execution_status == "success" else None
+        mark_to_market_delta_total_usd = onchain_delta_total_usd if execution_status != "success" else None
+
+        calibration_model_net_usd = self._safe_float(selected_raw_ev if selected_raw_ev is not None else selected_ev)
+        calibration_realized_net_usd = execution_realized_delta_total_usd
+        calibration_enabled_row = False
+        calibration_excluded_reason: str | None = None
+
+        if execution_status != "success":
+            calibration_excluded_reason = "non_execution_cycle"
+        elif calibration_model_net_usd is None:
+            calibration_excluded_reason = "model_missing"
+        elif calibration_realized_net_usd is None:
+            calibration_excluded_reason = "realized_missing"
+        else:
+            snapshot_position_total_usd = self._safe_float(onchain_snapshot.get("position_total_usd_est"))
+            lifecycle_open_position_usd = self._safe_float(result.get("lifecycle_open_position_usd"))
+            calibration_excluded_reason = self._calibration_execution_outlier_reason(
+                model_net_usd=float(calibration_model_net_usd),
+                realized_net_usd=float(calibration_realized_net_usd),
+                expected_fees_usd=self._safe_float(selected_fees),
+                expected_il_usd=self._safe_float(selected_il),
+                expected_total_cost_usd=self._safe_float(selected_cost),
+                snapshot_position_total_usd=snapshot_position_total_usd,
+                lifecycle_open_position_usd=lifecycle_open_position_usd,
+            )
+            if calibration_excluded_reason is None and onchain_delta_minutes is not None and onchain_delta_minutes > 20.0:
+                calibration_excluded_reason = "stale_delta_window"
+
+            if calibration_excluded_reason is None:
+                calibration_enabled_row = True
+            else:
+                calibration_realized_net_usd = None
+
         entry = {
             "event_type": "decision",
             "recorded_at": utc_now_iso(),
@@ -2376,6 +3043,23 @@ class OptimizerOrchestrator:
             "lifecycle_open_total_usd": result.get("lifecycle_open_total_usd"),
             "lifecycle_current_position_usd": result.get("lifecycle_current_position_usd"),
             "lifecycle_current_total_usd": result.get("lifecycle_current_total_usd"),
+            "market_state_stage": result.get("market_state_stage"),
+            "market_regime": result.get("market_regime"),
+            "regime_confidence": result.get("regime_confidence"),
+            "horizon_agreement_score": result.get("horizon_agreement_score"),
+            "short_medium_conflict_score": result.get("short_medium_conflict_score"),
+            "width_term_expansion": result.get("width_term_expansion"),
+            "uncertainty_score": result.get("uncertainty_score"),
+            "size_multiplier": result.get("size_multiplier"),
+            "candidate_family": result.get("candidate_family"),
+            "reentry_prob_15m": result.get("reentry_prob_15m"),
+            "reentry_prob_1h": result.get("reentry_prob_1h"),
+            "counterfactual_top_k": counterfactual_top_k,
+            "counterfactual_top_family": (
+                counterfactual_top_k[0].get("candidate_family")
+                if counterfactual_top_k and isinstance(counterfactual_top_k[0], dict)
+                else None
+            ),
             "policy_profit_triggered": bool(result.get("policy_profit_triggered")),
             "policy_loss_recovery_hold_triggered": bool(result.get("policy_loss_recovery_hold_triggered")),
             "policy_loss_trend_cut_triggered": bool(result.get("policy_loss_trend_cut_triggered")),
@@ -2429,11 +3113,19 @@ class OptimizerOrchestrator:
             "close_to_idle_should": should_close_to_idle,
             "rebalance_reason": rebalance.get("reason"),
             "gate_mode": result.get("gate_mode") or rebalance_gate.get("gate_mode"),
+            "untracked_pool_positions_count": rebalance_gate.get("untracked_pool_positions_count"),
+            "idle_open_blocked_untracked_positions": bool(rebalance_gate.get("idle_open_blocked_untracked_positions")),
             "execution_attempted": execution_attempted,
             "execution_status": execution_status,
             "execution_tx_count": len(tx_signatures),
             "execution_tx_signatures": tx_signatures,
             "execution_plan_error": str(execution_plan_error) if execution_plan_error else None,
+            "execution_realized_delta_total_usd_est": execution_realized_delta_total_usd,
+            "mark_to_market_delta_total_usd_est": mark_to_market_delta_total_usd,
+            "calibration_model_net_usd": calibration_model_net_usd,
+            "calibration_realized_net_usd": calibration_realized_net_usd,
+            "calibration_enabled_row": calibration_enabled_row,
+            "calibration_excluded_reason": calibration_excluded_reason,
             "realism_enabled": (result.get("realism") or {}).get("enabled") if isinstance(result.get("realism"), dict) else None,
             "realism_shadow_mode": (result.get("realism") or {}).get("shadow_mode") if isinstance(result.get("realism"), dict) else None,
             "realism_use_adjusted_for_decisions": (result.get("realism") or {}).get("use_adjusted_for_decisions")
@@ -2454,6 +3146,15 @@ class OptimizerOrchestrator:
             "realism_calibration_mode": ((result.get("realism") or {}).get("snapshot") or {}).get("mode")
             if isinstance((result.get("realism") or {}).get("snapshot"), dict)
             else None,
+            "realism_regime_label": ((result.get("realism") or {}).get("snapshot") or {}).get("regime_label")
+            if isinstance((result.get("realism") or {}).get("snapshot"), dict)
+            else None,
+            "realism_regime_sample_count": ((result.get("realism") or {}).get("snapshot") or {}).get("regime_sample_count")
+            if isinstance((result.get("realism") or {}).get("snapshot"), dict)
+            else None,
+            "realism_global_sample_count": ((result.get("realism") or {}).get("snapshot") or {}).get("global_sample_count")
+            if isinstance((result.get("realism") or {}).get("snapshot"), dict)
+            else None,
             "onchain_snapshot_at": onchain_snapshot.get("snapshot_at"),
             "onchain_wallet_pubkey": onchain_snapshot.get("wallet_pubkey"),
             "onchain_sol_balance": onchain_snapshot.get("sol_balance"),
@@ -2467,11 +3168,18 @@ class OptimizerOrchestrator:
             "onchain_total_usd_est": onchain_snapshot.get("total_usd_est"),
             "onchain_spot_price_sol_usdc": onchain_snapshot.get("spot_price_sol_usdc"),
             "onchain_active_position_exists": onchain_snapshot.get("active_position_exists"),
+            "onchain_pool_user_position_count": onchain_snapshot.get("pool_user_position_count"),
+            "onchain_pool_user_position_pubkeys": onchain_snapshot.get("pool_user_position_pubkeys"),
+            "onchain_pool_other_position_count": onchain_snapshot.get("pool_other_position_count"),
+            "onchain_pool_other_position_pubkeys": onchain_snapshot.get("pool_other_position_pubkeys"),
+            "onchain_tracked_position_detected": onchain_snapshot.get("tracked_position_detected"),
+            "onchain_pool_user_positions_error": onchain_snapshot.get("pool_user_positions_error"),
             "onchain_delta_sol": onchain_delta.get("delta_sol"),
             "onchain_delta_usdc": onchain_delta.get("delta_usdc"),
             "onchain_delta_wallet_total_usd_est": onchain_delta.get("delta_wallet_total_usd_est"),
             "onchain_delta_position_total_usd_est": onchain_delta.get("delta_position_total_usd_est"),
             "onchain_delta_total_usd_est": onchain_delta.get("delta_total_usd_est"),
+            "onchain_delta_has_equity_components": onchain_delta_has_equity_components,
             "onchain_delta_minutes_elapsed": onchain_delta.get("minutes_elapsed"),
         }
         self._append_trade_journal_entry(entry)
@@ -2688,6 +3396,8 @@ def _summarize_ev_candidate(candidate: EvScoredCandidate) -> dict[str, Any]:
         "range_change_bps_vs_active": candidate.range_change_bps_vs_active,
         "rebalance_structural_change": candidate.rebalance_structural_change,
         "action_type": candidate.action_type,
+        "candidate_family": candidate.candidate_family,
+        "market_regime": candidate.market_regime,
         "forecast": {
             "width_pct": candidate.forecast.width_pct,
             "lower_bound": candidate.forecast.lower_bound,
@@ -2696,6 +3406,7 @@ def _summarize_ev_candidate(candidate: EvScoredCandidate) -> dict[str, Any]:
             "expected_time_in_interval_minutes": candidate.forecast.expected_time_in_interval_minutes,
             "expected_impermanent_loss": candidate.forecast.expected_impermanent_loss,
         },
+        "scenario_breakdown": candidate.scenario_breakdown.to_dict() if candidate.scenario_breakdown else None,
         "ev_components": candidate.ev_components.to_dict(),
         "pre_rank_score": candidate.pre_rank_score,
     }
@@ -2707,6 +3418,65 @@ def _ev_candidate_key(candidate: EvScoredCandidate) -> tuple[str, float, float]:
         round(float(candidate.forecast.lower_bound), 8),
         round(float(candidate.forecast.upper_bound), 8),
     )
+
+
+def _counterfactual_candidate_key(candidate: EvScoredCandidate) -> tuple[str, str, str, float, float]:
+    return (
+        candidate.action_type,
+        candidate.pool_address,
+        candidate.candidate_family or "",
+        round(float(candidate.forecast.lower_bound), 8),
+        round(float(candidate.forecast.upper_bound), 8),
+    )
+
+
+def _collect_counterfactual_top_k(
+    *,
+    primary_candidates: list[EvScoredCandidate],
+    secondary_candidates: list[EvScoredCandidate],
+    hold_candidate: EvScoredCandidate | None,
+    idle_candidate: EvScoredCandidate | None,
+    use_adjusted: bool,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    merged: list[EvScoredCandidate] = []
+    merged.extend(primary_candidates)
+    merged.extend(secondary_candidates)
+    if hold_candidate is not None:
+        merged.append(hold_candidate)
+    if idle_candidate is not None:
+        merged.append(idle_candidate)
+
+    deduped: dict[tuple[str, str, str, float, float], EvScoredCandidate] = {}
+    for candidate in merged:
+        key = _counterfactual_candidate_key(candidate)
+        incumbent = deduped.get(key)
+        score = candidate.ev_components.adjusted_ev_15m_usd if use_adjusted else candidate.ev_15m_usd
+        incumbent_score = (
+            incumbent.ev_components.adjusted_ev_15m_usd if (incumbent is not None and use_adjusted) else (
+                incumbent.ev_15m_usd if incumbent is not None else None
+            )
+        )
+        if incumbent is None or float(score or 0.0) > float(incumbent_score or 0.0):
+            deduped[key] = candidate
+
+    ranked = sorted(
+        deduped.values(),
+        key=lambda candidate: (
+            float(
+                (
+                    candidate.ev_components.adjusted_ev_15m_usd
+                    if use_adjusted
+                    else candidate.ev_15m_usd
+                )
+                or 0.0
+            ),
+            float(candidate.ev_components.range_active_occupancy_15m or candidate.ev_components.active_occupancy_15m),
+            -float(candidate.forecast.width_pct),
+        ),
+        reverse=True,
+    )
+    return [_summarize_ev_candidate(candidate) for candidate in ranked[: max(1, int(limit))]]
 
 
 def _log_execution_details(details: dict[str, Any] | None) -> None:

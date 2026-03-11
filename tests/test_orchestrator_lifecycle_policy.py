@@ -14,6 +14,8 @@ from ai_liquidity_optimizer.models import (
     ExecutionApplyResult,
     MeteoraPoolSnapshot,
     SynthLpBoundForecast,
+    SynthHorizonState,
+    SynthMarketState,
     WeightedBinPlan,
 )
 from ai_liquidity_optimizer.orchestrator import OptimizerOrchestrator
@@ -125,6 +127,62 @@ def _candidate(
     )
 
 
+def _market_state(
+    *,
+    short_center: float,
+    medium_center: float,
+    regime: str = "trend_down",
+    reentry_15m: float = 0.20,
+    reentry_1h: float = 0.25,
+    agreement: float = 0.80,
+) -> SynthMarketState:
+    def _state(horizon: str, center: float, p_stay: float, width_pct: float = 1.2) -> SynthHorizonState:
+        forecast = SynthLpBoundForecast(
+            width_pct=width_pct,
+            lower_bound=center * (1.0 - width_pct / 200.0),
+            upper_bound=center * (1.0 + width_pct / 200.0),
+            probability_to_stay_in_interval=p_stay,
+            expected_time_in_interval_minutes=30.0,
+            expected_impermanent_loss=0.002,
+        )
+        return SynthHorizonState(
+            horizon=horizon,
+            forecast=forecast,
+            score=0.01,
+            center_price=center,
+            center_drift_bps=50.0,
+            center_drift_signed_bps=center - 85.0,
+            width_pct=width_pct,
+            occupancy_fraction=0.8,
+            probability_to_stay=p_stay,
+            expected_il=0.002,
+            out_of_range_prob_15m=0.30,
+            one_sided_break_prob=0.55,
+            directional_confidence=0.60,
+            reentry_probability=reentry_15m if horizon == "15m" else reentry_1h,
+            expected_out_of_range_minutes_15m=5.0,
+            current_price=85.0,
+        )
+
+    short = _state("15m", short_center, 0.45)
+    medium = _state("1h", medium_center, 0.55)
+    return SynthMarketState(
+        horizons={"15m": short, "1h": medium},
+        market_regime=regime,
+        regime_confidence=0.75,
+        horizon_agreement_score=agreement,
+        short_medium_conflict_score=max(0.0, 1.0 - agreement),
+        width_term_expansion=0.10,
+        uncertainty_score=0.20,
+        fused_center_price=(short_center + medium_center) / 2.0,
+        fused_width_pct=1.3,
+        reentry_prob_15m=reentry_15m,
+        reentry_prob_1h=reentry_1h,
+        size_multiplier=0.66,
+        current_price=85.0,
+    )
+
+
 class LifecyclePolicyDecisionTests(unittest.TestCase):
     def _orchestrator(self) -> OptimizerOrchestrator:
         settings = SimpleNamespace(
@@ -150,6 +208,10 @@ class LifecyclePolicyDecisionTests(unittest.TestCase):
             ev_trend_continue_exit_prob=0.72,
             ev_trend_exit_persistence_cycles=2,
             ev_idle_preference_edge_usd=0.01,
+            synth_market_state_stage="shadow",
+            synth_regime_min_agreement_score=0.60,
+            ev_oor_reentry_min_prob=0.60,
+            ev_oor_loss_trigger_pct=0.0,
         )
         return OptimizerOrchestrator(
             settings=settings,
@@ -388,6 +450,62 @@ class LifecyclePolicyDecisionTests(unittest.TestCase):
         self.assertTrue(str(reason).startswith("oor_reentry_hold_"))
         self.assertTrue(bool(gate.get("policy_oor_reentry_hold_triggered")))
         self.assertEqual(gate.get("policy_selected_override"), "oor_reentry_hold")
+
+    def test_full_stage_holds_loss_position_when_short_reentry_and_medium_supportive(self):
+        orchestrator = self._orchestrator()
+        orchestrator.settings.synth_market_state_stage = "full"
+        state = self._active_state()
+        best = _candidate(ev_usd=0.080, action_type="rebalance", structural_change=True)
+        hold = _candidate(ev_usd=0.010, action_type="hold", structural_change=False)
+        idle = _candidate(ev_usd=-0.001, action_type="idle", structural_change=True)
+
+        selected_action, should_rebalance, should_close_idle, reason, gate, _protective, _delta, _scores = (
+            orchestrator._decide_ev_action(
+                state=state,
+                best=best,
+                ev_current_hold=hold,
+                idle_candidate=idle,
+                prior_protective_breach_count=0,
+                hold_oor_cycles=0,
+                action_cooldown_remaining=0,
+                lifecycle_metrics={"lifecycle_pnl_usd": -0.20, "lifecycle_pnl_pct": -0.02},
+                market_state=_market_state(short_center=85.2, medium_center=85.4, reentry_15m=0.75, reentry_1h=0.70),
+            )
+        )
+
+        self.assertEqual(selected_action, "hold")
+        self.assertFalse(should_rebalance)
+        self.assertFalse(should_close_idle)
+        self.assertEqual(reason, "synth_reentry_hold")
+        self.assertEqual(gate.get("policy_selected_override"), "synth_reentry_hold")
+
+    def test_full_stage_exits_losing_position_when_both_horizons_trend_away(self):
+        orchestrator = self._orchestrator()
+        orchestrator.settings.synth_market_state_stage = "full"
+        state = self._active_state()
+        best = _candidate(ev_usd=0.040, action_type="rebalance", structural_change=True)
+        hold = _candidate(ev_usd=0.045, action_type="hold", structural_change=False)
+        idle = _candidate(ev_usd=-0.001, action_type="idle", structural_change=True)
+
+        selected_action, should_rebalance, should_close_idle, reason, gate, _protective, _delta, _scores = (
+            orchestrator._decide_ev_action(
+                state=state,
+                best=best,
+                ev_current_hold=hold,
+                idle_candidate=idle,
+                prior_protective_breach_count=0,
+                hold_oor_cycles=2,
+                action_cooldown_remaining=0,
+                lifecycle_metrics={"lifecycle_pnl_usd": -0.20, "lifecycle_pnl_pct": -0.02},
+                market_state=_market_state(short_center=83.0, medium_center=82.8, reentry_15m=0.20, reentry_1h=0.25),
+            )
+        )
+
+        self.assertEqual(selected_action, "rebalance")
+        self.assertTrue(should_rebalance)
+        self.assertFalse(should_close_idle)
+        self.assertEqual(reason, "synth_trend_exit")
+        self.assertEqual(gate.get("policy_selected_override"), "synth_trend_exit")
 
 
 if __name__ == "__main__":

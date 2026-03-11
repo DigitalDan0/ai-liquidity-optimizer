@@ -25,6 +25,12 @@ def _parse_float(value: str | None, default: float) -> float:
     return float(value)
 
 
+def _parse_csv_list(value: str | None, default: list[str]) -> list[str]:
+    if value is None or value.strip() == "":
+        return list(default)
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def _require_env_value(env: Mapping[str, str], key: str) -> str:
     value = env.get(key)
     if value is None or value == "":
@@ -62,6 +68,17 @@ class Settings:
     synth_base_url: str
     synth_asset: str
     synth_horizon: str
+    synth_fusion_horizons: list[str]
+    synth_market_state_stage: str
+    synth_regime_range_max_center_drift_ratio: float
+    synth_regime_trend_min_center_drift_ratio: float
+    synth_regime_trend_min_onesided_prob: float
+    synth_regime_min_agreement_score: float
+    synth_regime_uncertain_width_expansion: float
+    synth_entry_conflict_threshold: float
+    synth_size_low_confidence: float
+    synth_size_medium_confidence: float
+    synth_size_full_confidence: float
     synth_days: int
     synth_limit: int
     meteora_api_base_url: str
@@ -140,6 +157,11 @@ class Settings:
     ev_rebalance_drag_min_usd: float
     ev_rebalance_drag_max_usd: float
     ev_uncertainty_k: float
+    ev_realism_regime_min_samples: int
+    ev_realism_regime_blend_max: float
+    ev_calibration_max_realized_position_fraction: float
+    ev_calibration_max_error_position_fraction: float
+    ev_calibration_max_error_model_scale_multiple: float
     ev_dynamic_gate_enabled: bool
     ev_dynamic_gate_base_margin_usd: float
     ev_dynamic_gate_sigma_mult: float
@@ -162,12 +184,44 @@ class Settings:
     state_path: Path
     trade_journal_enabled: bool
     trade_journal_path: Path
+    execution_health_window_minutes: int
+    execution_health_max_rpc_rate_limit_errors: int
+    execution_health_max_upstream_timeout_errors: int
     log_level: str
     repo_root: Path
 
     def validate(self) -> None:
         if self.synth_asset.upper() != "SOL":
             raise ValueError("This MVP only supports SYNTH_ASSET=SOL.")
+        if not self.synth_fusion_horizons:
+            raise ValueError("SYNTH_FUSION_HORIZONS must contain at least one horizon.")
+        for horizon in self.synth_fusion_horizons:
+            if not horizon:
+                raise ValueError("SYNTH_FUSION_HORIZONS cannot contain blank entries.")
+        if self.synth_market_state_stage not in {"shadow", "entry_size", "full"}:
+            raise ValueError("SYNTH_MARKET_STATE_STAGE must be 'shadow', 'entry_size', or 'full'.")
+        if self.synth_regime_range_max_center_drift_ratio < 0:
+            raise ValueError("SYNTH_REGIME_RANGE_MAX_CENTER_DRIFT_RATIO must be >= 0.")
+        if self.synth_regime_trend_min_center_drift_ratio < 0:
+            raise ValueError("SYNTH_REGIME_TREND_MIN_CENTER_DRIFT_RATIO must be >= 0.")
+        if self.synth_regime_trend_min_onesided_prob < 0 or self.synth_regime_trend_min_onesided_prob > 1:
+            raise ValueError("SYNTH_REGIME_TREND_MIN_ONESIDED_PROB must be in [0, 1].")
+        if self.synth_regime_min_agreement_score < 0 or self.synth_regime_min_agreement_score > 1:
+            raise ValueError("SYNTH_REGIME_MIN_AGREEMENT_SCORE must be in [0, 1].")
+        if self.synth_regime_uncertain_width_expansion < 0:
+            raise ValueError("SYNTH_REGIME_UNCERTAIN_WIDTH_EXPANSION must be >= 0.")
+        if self.synth_entry_conflict_threshold < 0 or self.synth_entry_conflict_threshold > 1:
+            raise ValueError("SYNTH_ENTRY_CONFLICT_THRESHOLD must be in [0, 1].")
+        if self.synth_size_low_confidence < 0 or self.synth_size_low_confidence > 1:
+            raise ValueError("SYNTH_SIZE_LOW_CONFIDENCE must be in [0, 1].")
+        if self.synth_size_medium_confidence < 0 or self.synth_size_medium_confidence > 1:
+            raise ValueError("SYNTH_SIZE_MEDIUM_CONFIDENCE must be in [0, 1].")
+        if self.synth_size_full_confidence < 0 or self.synth_size_full_confidence > 1:
+            raise ValueError("SYNTH_SIZE_FULL_CONFIDENCE must be in [0, 1].")
+        if not (self.synth_size_low_confidence <= self.synth_size_medium_confidence <= self.synth_size_full_confidence):
+            raise ValueError(
+                "Synth size confidence thresholds must satisfy low <= medium <= full."
+            )
         if self.executor not in {"dry-run", "meteora-node"}:
             raise ValueError("EXECUTOR must be 'dry-run' or 'meteora-node'.")
         if self.meteora_liquidity_mode not in {"spot", "synth_weights"}:
@@ -296,10 +350,26 @@ class Settings:
             raise ValueError("EV_REBALANCE_DRAG_MIN_USD cannot exceed EV_REBALANCE_DRAG_MAX_USD.")
         if self.ev_uncertainty_k < 0:
             raise ValueError("EV_UNCERTAINTY_K must be >= 0.")
+        if self.ev_realism_regime_min_samples <= 0:
+            raise ValueError("EV_REALISM_REGIME_MIN_SAMPLES must be > 0.")
+        if self.ev_realism_regime_blend_max < 0 or self.ev_realism_regime_blend_max > 1:
+            raise ValueError("EV_REALISM_REGIME_BLEND_MAX must be in [0, 1].")
+        if self.ev_calibration_max_realized_position_fraction <= 0:
+            raise ValueError("EV_CALIBRATION_MAX_REALIZED_POSITION_FRACTION must be > 0.")
+        if self.ev_calibration_max_error_position_fraction <= 0:
+            raise ValueError("EV_CALIBRATION_MAX_ERROR_POSITION_FRACTION must be > 0.")
+        if self.ev_calibration_max_error_model_scale_multiple <= 0:
+            raise ValueError("EV_CALIBRATION_MAX_ERROR_MODEL_SCALE_MULTIPLE must be > 0.")
         if self.ev_dynamic_gate_base_margin_usd < 0:
             raise ValueError("EV_DYNAMIC_GATE_BASE_MARGIN_USD must be >= 0.")
         if self.ev_dynamic_gate_sigma_mult < 0:
             raise ValueError("EV_DYNAMIC_GATE_SIGMA_MULT must be >= 0.")
+        if self.execution_health_window_minutes <= 0:
+            raise ValueError("EXECUTION_HEALTH_WINDOW_MINUTES must be > 0.")
+        if self.execution_health_max_rpc_rate_limit_errors < 0:
+            raise ValueError("EXECUTION_HEALTH_MAX_RPC_RATE_LIMIT_ERRORS must be >= 0.")
+        if self.execution_health_max_upstream_timeout_errors < 0:
+            raise ValueError("EXECUTION_HEALTH_MAX_UPSTREAM_TIMEOUT_ERRORS must be >= 0.")
         if self.pool_candidate_limit <= 0:
             raise ValueError("POOL_CANDIDATE_LIMIT must be > 0.")
         if self.top_k_ranges_per_pool <= 0:
@@ -345,6 +415,17 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
         synth_base_url=env.get("SYNTH_BASE_URL", "https://api.synthdata.co").rstrip("/"),
         synth_asset=env.get("SYNTH_ASSET", "SOL").upper(),
         synth_horizon=env.get("SYNTH_HORIZON", "1h" if _parse_bool(env.get("EV_MODE"), True) else "24h"),
+        synth_fusion_horizons=_parse_csv_list(env.get("SYNTH_FUSION_HORIZONS"), ["15m", "1h", "4h", "24h"]),
+        synth_market_state_stage=env.get("SYNTH_MARKET_STATE_STAGE", "shadow").strip().lower(),
+        synth_regime_range_max_center_drift_ratio=_parse_float(env.get("SYNTH_REGIME_RANGE_MAX_CENTER_DRIFT_RATIO"), 0.25),
+        synth_regime_trend_min_center_drift_ratio=_parse_float(env.get("SYNTH_REGIME_TREND_MIN_CENTER_DRIFT_RATIO"), 0.40),
+        synth_regime_trend_min_onesided_prob=_parse_float(env.get("SYNTH_REGIME_TREND_MIN_ONESIDED_PROB"), 0.45),
+        synth_regime_min_agreement_score=_parse_float(env.get("SYNTH_REGIME_MIN_AGREEMENT_SCORE"), 0.60),
+        synth_regime_uncertain_width_expansion=_parse_float(env.get("SYNTH_REGIME_UNCERTAIN_WIDTH_EXPANSION"), 0.35),
+        synth_entry_conflict_threshold=_parse_float(env.get("SYNTH_ENTRY_CONFLICT_THRESHOLD"), 0.45),
+        synth_size_low_confidence=_parse_float(env.get("SYNTH_SIZE_LOW_CONFIDENCE"), 0.35),
+        synth_size_medium_confidence=_parse_float(env.get("SYNTH_SIZE_MEDIUM_CONFIDENCE"), 0.55),
+        synth_size_full_confidence=_parse_float(env.get("SYNTH_SIZE_FULL_CONFIDENCE"), 0.75),
         synth_days=_parse_int(env.get("SYNTH_DAYS"), 30),
         synth_limit=_parse_int(env.get("SYNTH_LIMIT"), 20),
         meteora_api_base_url=env.get("METEORA_API_BASE_URL", "https://dlmm.datapi.meteora.ag").rstrip("/"),
@@ -426,6 +507,20 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
         ev_rebalance_drag_min_usd=_parse_float(env.get("EV_REBALANCE_DRAG_MIN_USD"), 0.000),
         ev_rebalance_drag_max_usd=_parse_float(env.get("EV_REBALANCE_DRAG_MAX_USD"), 0.050),
         ev_uncertainty_k=_parse_float(env.get("EV_UNCERTAINTY_K"), 1.00),
+        ev_realism_regime_min_samples=_parse_int(env.get("EV_REALISM_REGIME_MIN_SAMPLES"), 8),
+        ev_realism_regime_blend_max=_parse_float(env.get("EV_REALISM_REGIME_BLEND_MAX"), 0.60),
+        ev_calibration_max_realized_position_fraction=_parse_float(
+            env.get("EV_CALIBRATION_MAX_REALIZED_POSITION_FRACTION"),
+            0.30,
+        ),
+        ev_calibration_max_error_position_fraction=_parse_float(
+            env.get("EV_CALIBRATION_MAX_ERROR_POSITION_FRACTION"),
+            0.30,
+        ),
+        ev_calibration_max_error_model_scale_multiple=_parse_float(
+            env.get("EV_CALIBRATION_MAX_ERROR_MODEL_SCALE_MULTIPLE"),
+            25.0,
+        ),
         ev_dynamic_gate_enabled=_parse_bool(env.get("EV_DYNAMIC_GATE_ENABLED"), True),
         ev_dynamic_gate_base_margin_usd=_parse_float(env.get("EV_DYNAMIC_GATE_BASE_MARGIN_USD"), 0.003),
         ev_dynamic_gate_sigma_mult=_parse_float(env.get("EV_DYNAMIC_GATE_SIGMA_MULT"), 1.00),
@@ -448,6 +543,9 @@ def load_settings(repo_root: Path, env_file: Path | None = None) -> Settings:
         state_path=state_path,
         trade_journal_enabled=_parse_bool(env.get("TRADE_JOURNAL_ENABLED"), True),
         trade_journal_path=trade_journal_path,
+        execution_health_window_minutes=_parse_int(env.get("EXECUTION_HEALTH_WINDOW_MINUTES"), 60),
+        execution_health_max_rpc_rate_limit_errors=_parse_int(env.get("EXECUTION_HEALTH_MAX_RPC_RATE_LIMIT_ERRORS"), 3),
+        execution_health_max_upstream_timeout_errors=_parse_int(env.get("EXECUTION_HEALTH_MAX_UPSTREAM_TIMEOUT_ERRORS"), 3),
         log_level=env.get("LOG_LEVEL", "INFO").upper(),
         repo_root=repo_root,
     )

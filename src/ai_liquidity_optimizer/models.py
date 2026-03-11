@@ -78,6 +78,101 @@ class SynthPredictionPercentilesSnapshot:
 
 
 @dataclass(slots=True)
+class SynthHorizonState:
+    horizon: str
+    forecast: SynthLpBoundForecast
+    score: float
+    center_price: float
+    center_drift_bps: float
+    center_drift_signed_bps: float
+    width_pct: float
+    occupancy_fraction: float
+    probability_to_stay: float
+    expected_il: float
+    out_of_range_prob_15m: float
+    one_sided_break_prob: float
+    directional_confidence: float
+    reentry_probability: float
+    expected_out_of_range_minutes_15m: float | None = None
+    current_price: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "horizon": self.horizon,
+            "forecast": {
+                "width_pct": self.forecast.width_pct,
+                "lower_bound": self.forecast.lower_bound,
+                "upper_bound": self.forecast.upper_bound,
+                "probability_to_stay_in_interval": self.forecast.probability_to_stay_in_interval,
+                "expected_time_in_interval_minutes": self.forecast.expected_time_in_interval_minutes,
+                "expected_impermanent_loss": self.forecast.expected_impermanent_loss,
+            },
+            "score": self.score,
+            "center_price": self.center_price,
+            "center_drift_bps": self.center_drift_bps,
+            "center_drift_signed_bps": self.center_drift_signed_bps,
+            "width_pct": self.width_pct,
+            "occupancy_fraction": self.occupancy_fraction,
+            "probability_to_stay": self.probability_to_stay,
+            "expected_il": self.expected_il,
+            "out_of_range_prob_15m": self.out_of_range_prob_15m,
+            "one_sided_break_prob": self.one_sided_break_prob,
+            "directional_confidence": self.directional_confidence,
+            "reentry_probability": self.reentry_probability,
+            "expected_out_of_range_minutes_15m": self.expected_out_of_range_minutes_15m,
+            "current_price": self.current_price,
+        }
+
+
+@dataclass(slots=True)
+class ScenarioEvBreakdown:
+    stay_prob: float
+    exit_reenter_prob: float
+    breakout_up_prob: float
+    breakout_down_prob: float
+    expected_active_minutes_before_exit: float
+    reentry_probability: float
+    inventory_bias: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class SynthMarketState:
+    horizons: dict[str, SynthHorizonState]
+    market_regime: str
+    regime_confidence: float
+    horizon_agreement_score: float
+    short_medium_conflict_score: float
+    width_term_expansion: float
+    uncertainty_score: float
+    fused_center_price: float
+    fused_width_pct: float
+    reentry_prob_15m: float | None = None
+    reentry_prob_1h: float | None = None
+    size_multiplier: float = 1.0
+    current_price: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "horizons": {key: value.to_dict() for key, value in self.horizons.items()},
+            "market_regime": self.market_regime,
+            "regime_confidence": self.regime_confidence,
+            "horizon_agreement_score": self.horizon_agreement_score,
+            "short_medium_conflict_score": self.short_medium_conflict_score,
+            "width_term_expansion": self.width_term_expansion,
+            "uncertainty_score": self.uncertainty_score,
+            "fused_center_price": self.fused_center_price,
+            "fused_width_pct": self.fused_width_pct,
+            "reentry_prob_15m": self.reentry_prob_15m,
+            "reentry_prob_1h": self.reentry_prob_1h,
+            "size_multiplier": self.size_multiplier,
+            "current_price": self.current_price,
+        }
+
+
+@dataclass(slots=True)
 class MeteoraPoolSnapshot:
     address: str
     name: str
@@ -285,6 +380,13 @@ class EvComponentBreakdown:
     adjusted_ev_15m_usd: float | None = None
     calibration_sample_count: int | None = None
     calibration_mode: str | None = None
+    scenario_stay_prob: float | None = None
+    scenario_exit_reenter_prob: float | None = None
+    scenario_breakout_up_prob: float | None = None
+    scenario_breakout_down_prob: float | None = None
+    expected_active_minutes_before_exit: float | None = None
+    reentry_probability: float | None = None
+    inventory_bias: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -305,6 +407,9 @@ class EvScoredCandidate:
     pool_switch: bool = False
     range_change_bps_vs_active: float | None = None
     action_type: str = "rebalance"
+    candidate_family: str | None = None
+    market_regime: str | None = None
+    scenario_breakdown: ScenarioEvBreakdown | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -328,6 +433,9 @@ class EvScoredCandidate:
             "pool_switch": self.pool_switch,
             "range_change_bps_vs_active": self.range_change_bps_vs_active,
             "action_type": self.action_type,
+            "candidate_family": self.candidate_family,
+            "market_regime": self.market_regime,
+            "scenario_breakdown": self.scenario_breakdown.to_dict() if self.scenario_breakdown else None,
         }
 
 

@@ -320,6 +320,24 @@ async function handleWalletSnapshot(input) {
     tokenY = await getTokenUiBalanceByMint(connection, walletPubkey, String(mintY), decimalsY);
   }
 
+  let poolUserPositions = [];
+  let poolUserPositionsError = null;
+  if (dlmmPool) {
+    try {
+      const byUserAndPair = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
+      const rawUserPositions = Array.isArray(byUserAndPair?.userPositions) ? byUserAndPair.userPositions : [];
+      poolUserPositions = summarizePoolUserPositions(rawUserPositions, {
+        symbolX,
+        symbolY,
+        decimalsX,
+        decimalsY,
+        spotSolUsdc
+      });
+    } catch (error) {
+      poolUserPositionsError = String(error?.message || error);
+    }
+  }
+
   let walletSolTokenUi = null;
   let walletUsdcTokenUi = null;
   if (tokenX && tokenY) {
@@ -402,6 +420,22 @@ async function handleWalletSnapshot(input) {
     }
   }
 
+  const trackedPositionPubkey = active_position?.position_pubkey ? String(active_position.position_pubkey) : null;
+  const poolUserPositionPubkeys = poolUserPositions
+    .map((position) => String(position?.position_pubkey || ""))
+    .filter((value) => value.length > 0);
+  const trackedPositionDetected =
+    trackedPositionPubkey != null
+      ? poolUserPositionPubkeys.includes(trackedPositionPubkey)
+      : null;
+  const poolOtherPositions =
+    trackedPositionPubkey == null
+      ? poolUserPositions
+      : poolUserPositions.filter((position) => String(position?.position_pubkey || "") !== trackedPositionPubkey);
+  const poolOtherPositionPubkeys = poolOtherPositions
+    .map((position) => String(position?.position_pubkey || ""))
+    .filter((value) => value.length > 0);
+
   const totalUsdEst =
     walletTotalUsdEst != null || numberOrNull(positionSnapshot?.total_usd_est) != null
       ? (walletTotalUsdEst || 0) + (numberOrNull(positionSnapshot?.total_usd_est) || 0)
@@ -441,7 +475,15 @@ async function handleWalletSnapshot(input) {
     spot_price_sol_usdc: spotSolUsdc,
     total_usd_est: totalUsdEst,
     pool_balances: poolBalances,
-    active_position_exists: activePositionExists
+    active_position_exists: activePositionExists,
+    pool_user_positions: poolUserPositions,
+    pool_user_position_count: poolUserPositions.length,
+    pool_user_position_pubkeys: poolUserPositionPubkeys,
+    pool_other_position_count: poolOtherPositions.length,
+    pool_other_position_pubkeys: poolOtherPositionPubkeys,
+    tracked_position_pubkey: trackedPositionPubkey,
+    tracked_position_detected: trackedPositionDetected,
+    pool_user_positions_error: poolUserPositionsError
   });
 }
 
@@ -503,6 +545,58 @@ function publicKeyLikeToString(value) {
     return null;
   }
   return null;
+}
+
+function summarizePoolUserPositions(rawUserPositions, { symbolX, symbolY, decimalsX, decimalsY, spotSolUsdc }) {
+  if (!Array.isArray(rawUserPositions) || rawUserPositions.length === 0) return [];
+  const out = [];
+  for (const row of rawUserPositions) {
+    if (!row || typeof row !== "object") continue;
+    const positionPubkey = publicKeyLikeToString(row.publicKey);
+    const positionData = row.positionData;
+    if (!positionData || typeof positionData !== "object") continue;
+
+    const totalXRaw = bnLikeToBigInt(positionData.totalXAmountExcludeTransferFee ?? positionData.totalXAmount) ?? 0n;
+    const totalYRaw = bnLikeToBigInt(positionData.totalYAmountExcludeTransferFee ?? positionData.totalYAmount) ?? 0n;
+    const feeXRaw = bnLikeToBigInt(positionData.feeXExcludeTransferFee ?? positionData.feeX) ?? 0n;
+    const feeYRaw = bnLikeToBigInt(positionData.feeYExcludeTransferFee ?? positionData.feeY) ?? 0n;
+    if (totalXRaw <= 0n && totalYRaw <= 0n && feeXRaw <= 0n && feeYRaw <= 0n) {
+      continue;
+    }
+
+    const totalXUi = bigIntToUi(totalXRaw, decimalsX);
+    const totalYUi = bigIntToUi(totalYRaw, decimalsY);
+    const feeXUi = bigIntToUi(feeXRaw, decimalsX);
+    const feeYUi = bigIntToUi(feeYRaw, decimalsY);
+
+    let totalSolUi = null;
+    let totalUsdcUi = null;
+    if (symbolX === "SOL" && symbolY === "USDC") {
+      totalSolUi = totalXUi + feeXUi;
+      totalUsdcUi = totalYUi + feeYUi;
+    } else if (symbolX === "USDC" && symbolY === "SOL") {
+      totalSolUi = totalYUi + feeYUi;
+      totalUsdcUi = totalXUi + feeXUi;
+    }
+    const totalUsdEst =
+      spotSolUsdc != null && totalSolUi != null && totalUsdcUi != null
+        ? totalUsdcUi + totalSolUi * spotSolUsdc
+        : null;
+
+    out.push({
+      position_pubkey: positionPubkey,
+      lower_bin_id: Number.isFinite(Number(positionData.lowerBinId)) ? Number(positionData.lowerBinId) : null,
+      upper_bin_id: Number.isFinite(Number(positionData.upperBinId)) ? Number(positionData.upperBinId) : null,
+      total_x_ui: totalXUi,
+      total_y_ui: totalYUi,
+      fee_x_ui: feeXUi,
+      fee_y_ui: feeYUi,
+      total_sol_ui: totalSolUi,
+      total_usdc_ui: totalUsdcUi,
+      total_usd_est: totalUsdEst
+    });
+  }
+  return out;
 }
 
 async function handleQuoteRangeBins(input) {

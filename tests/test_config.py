@@ -76,6 +76,19 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(settings.ev_realism_enabled)
         self.assertEqual(settings.ev_realism_window_hours, 168)
         self.assertEqual(settings.ev_realism_min_samples, 30)
+        self.assertEqual(settings.synth_fusion_horizons, ["15m", "1h", "4h", "24h"])
+        self.assertEqual(settings.synth_market_state_stage, "shadow")
+        self.assertAlmostEqual(settings.synth_regime_range_max_center_drift_ratio, 0.25, places=9)
+        self.assertAlmostEqual(settings.synth_regime_trend_min_center_drift_ratio, 0.40, places=9)
+        self.assertAlmostEqual(settings.synth_regime_trend_min_onesided_prob, 0.45, places=9)
+        self.assertAlmostEqual(settings.synth_regime_min_agreement_score, 0.60, places=9)
+        self.assertAlmostEqual(settings.synth_regime_uncertain_width_expansion, 0.35, places=9)
+        self.assertAlmostEqual(settings.synth_entry_conflict_threshold, 0.45, places=9)
+        self.assertAlmostEqual(settings.synth_size_low_confidence, 0.35, places=9)
+        self.assertAlmostEqual(settings.synth_size_medium_confidence, 0.55, places=9)
+        self.assertAlmostEqual(settings.synth_size_full_confidence, 0.75, places=9)
+        self.assertEqual(settings.ev_realism_regime_min_samples, 8)
+        self.assertAlmostEqual(settings.ev_realism_regime_blend_max, 0.60, places=9)
         self.assertAlmostEqual(settings.ev_fee_realism_prior, 0.35, places=9)
         self.assertAlmostEqual(settings.ev_fee_realism_min, 0.10, places=9)
         self.assertAlmostEqual(settings.ev_fee_realism_max, 0.85, places=9)
@@ -83,6 +96,9 @@ class SettingsTests(unittest.TestCase):
         self.assertAlmostEqual(settings.ev_rebalance_drag_min_usd, 0.000, places=9)
         self.assertAlmostEqual(settings.ev_rebalance_drag_max_usd, 0.050, places=9)
         self.assertAlmostEqual(settings.ev_uncertainty_k, 1.00, places=9)
+        self.assertAlmostEqual(settings.ev_calibration_max_realized_position_fraction, 0.30, places=9)
+        self.assertAlmostEqual(settings.ev_calibration_max_error_position_fraction, 0.30, places=9)
+        self.assertAlmostEqual(settings.ev_calibration_max_error_model_scale_multiple, 25.0, places=9)
         self.assertTrue(settings.ev_dynamic_gate_enabled)
         self.assertAlmostEqual(settings.ev_dynamic_gate_base_margin_usd, 0.003, places=9)
         self.assertAlmostEqual(settings.ev_dynamic_gate_sigma_mult, 1.00, places=9)
@@ -226,6 +242,36 @@ class SettingsTests(unittest.TestCase):
                     "RANGE_CHANGE_THRESHOLD_BPS=10",
                     "EV_FEE_REALISM_MIN=0.7",
                     "EV_FEE_REALISM_MAX=0.5",
+                ],
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValueError):
+                    load_settings(repo_root=root, env_file=env_file)
+
+    def test_rejects_invalid_calibration_scale_thresholds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_file = self._write_env(
+                root,
+                [
+                    "SYNTH_API_KEY=test-key",
+                    "RANGE_CHANGE_THRESHOLD_BPS=10",
+                    "EV_CALIBRATION_MAX_ERROR_MODEL_SCALE_MULTIPLE=0",
+                ],
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValueError):
+                    load_settings(repo_root=root, env_file=env_file)
+
+    def test_rejects_invalid_synth_market_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_file = self._write_env(
+                root,
+                [
+                    "SYNTH_API_KEY=test-key",
+                    "RANGE_CHANGE_THRESHOLD_BPS=10",
+                    "SYNTH_MARKET_STATE_STAGE=bad-stage",
                 ],
             )
             with patch.dict(os.environ, {}, clear=True):

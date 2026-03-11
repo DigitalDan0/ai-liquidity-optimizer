@@ -1,150 +1,301 @@
-# AI Liquidity Optimizer (Hackathon MVP)
+# AI Liquidity Optimizer
 
-A minimal Python-first bot that uses Synth probabilistic LP forecasts to choose a SOL/USDC price range and manage a single Meteora DLMM position.
+A probabilistic liquidity placement and market-making bot for Meteora DLMM, powered by Synth forecast data.
 
-Scope (intentionally strict):
-- Asset: `SOL`
-- Pool: `SOL/USDC`
-- One active position only
-- Periodic rebalance loop (default `10` minutes, configurable)
-- No UI
-- Chain-agnostic strategy core with execution adapter separation
+The project is focused on a single live strategy today:
+- asset: `SOL`
+- pool: `SOL/USDC`
+- venue: `Meteora DLMM`
+- position model: `one active position at a time`
+- control loop: periodic rebalance / hold / idle decisions
 
-## What It Does
+The core idea is simple: concentrated liquidity is a probabilistic inventory and volatility problem, not just a static range-picking problem. This bot uses Synth's probabilistic market data to decide where to place liquidity, when to stay put, when to rotate, and when to do nothing.
 
-Every cycle, the bot:
-1. Fetches Synth LP bounds forecasts (probability to stay in range, expected time in range, expected impermanent loss)
-2. Fetches Meteora DLMM pool metadata/metrics for SOL/USDC
-3. Scores candidate ranges using a simple expected net return proxy
-4. Rebalances the active position when the optimal range materially changes
+## What The Bot Does
 
-## Doc-Derived Integration Notes
+On each cycle, the bot:
+1. pulls Synth market data
+2. pulls Meteora pool state and fee data
+3. builds a multi-horizon market state
+4. scores candidate actions using scenario-based EV
+5. applies realism calibration from realized on-chain outcomes
+6. gates actions through safety and execution-health checks
+7. either holds, idles, or executes a new Meteora DLMM position
+8. writes a detailed decision row to the trade journal for later analysis
 
-This implementation was based on the official docs you linked:
+## Synth Data Used
 
-- Synth trading/LP insights docs: [docs.synthdata.co/insights/trading](https://docs.synthdata.co/insights/trading)
-  - Uses `GET /insights/lp-bounds` on `https://api.synthdata.co`
-  - Auth header format: `Authorization: Apikey <key>`
-  - Forecast fields used in this MVP:
-    - `width_pct`
-    - `lower_bound`
-    - `upper_bound`
-    - `probability_to_stay_in_interval`
-    - `expected_time_in_interval`
-    - `expected_impermanent_loss`
+The strategy consumes three Synth data products:
+- `GET /insights/lp-bounds`
+- `GET /insights/lp-probabilities`
+- `GET /insights/prediction-percentiles`
 
-- Meteora DLMM overview and docs:
-  - Overview / DLMM concept: [docs.meteora.ag](https://docs.meteora.ag/overview/products/dlmm/what-is-dlmm)
-  - DLMM API reference (pool discovery/metrics): [docs.meteora.ag/api-reference/dlmm/overview](https://docs.meteora.ag/api-reference/dlmm/overview)
-  - DLMM SDK functions: [docs.meteora.ag/developer-guide/guides/dlmm/typescript-sdk/sdk-functions](https://docs.meteora.ag/developer-guide/guides/dlmm/typescript-sdk/sdk-functions)
+Those inputs are used differently:
+- `lp-bounds` provides candidate ranges, stay probability, expected time in range, and expected IL
+- `lp-probabilities` provides distribution shape information used for breakout, one-sided inventory, and reentry estimates
+- `prediction-percentiles` provides a forward price path distribution used for path-aware occupancy and exact bin weighting
 
-Important behavior note:
-- Meteora DLMM position ranges are not edited in place; rebalancing is implemented as remove/close old position + create new one (via the SDK flow).
+The bot currently works with a fused horizon set of `15m`, `1h`, and `24h`.
+When Synth does not expose `15m` `lp-bounds` directly, the bot synthesizes a short-horizon forecast from `prediction-percentiles` rather than dropping the short horizon entirely.
 
-## Strategy Scoring (MVP)
+## Decision Engine
 
-The bot scores each Synth-provided candidate range using a simple risk-adjusted proxy:
+### 1. Multi-Horizon Market State
 
-- Base fee return proxy from Meteora pool metrics (`fee_tvl_ratio_24h` when available, else `fees_24h / liquidity`)
-- Scaled by Synth `expected_time_in_interval / horizon`
-- Further confidence-adjusted by Synth `probability_to_stay_in_interval`
-- Minus Synth `expected_impermanent_loss`
+The strategy constructs a `SynthMarketState` from the available horizons and derives:
+- fused center price
+- fused width
+- cross-horizon agreement score
+- short-vs-medium conflict score
+- width term expansion
+- reentry probability
+- one-sided breakout risk
+- regime confidence
 
-This is intentionally simple for hackathon speed and can be upgraded later.
+From that state, it labels the market as one of:
+- `range`
+- `trend_up`
+- `trend_down`
+- `uncertain`
+
+### 2. Candidate Ladder
+
+Instead of scoring a single static range, the bot builds a deterministic ladder of candidate actions such as:
+- fused symmetric range
+- trend-skewed range
+- defensive wide range
+- hold current range
+- idle
+
+### 3. Scenario-Based EV
+
+Each candidate is scored across four Synth-derived scenarios:
+- stay in range
+- exit then reenter
+- breakout up
+- breakout down
+
+The EV model tracks:
+- expected fee capture
+- expected impermanent loss
+- expected active minutes before exit
+- reentry probability
+- directional inventory bias
+- explicit rebalance and switching costs
+
+### 4. Realized-First Calibration
+
+Raw modeled EV is not trusted on its own.
+The strategy applies a realism layer that learns from the trade journal and adjusts:
+- fee realism
+- rebalance drag
+- model uncertainty
+
+Important design choice:
+- realism is `execution-only`
+- non-execution cycles and mark-to-market noise do not train the calibration model
+
+The calibration path is conservative by design:
+- sparse data falls back to priors
+- regime-specific calibration only blends in after enough samples
+- obvious legacy execution accounting artifacts are excluded from calibration without deleting raw history
+
+### 5. Staged Rollout
+
+The Synth market-state layer supports three rollout stages:
+- `shadow`: compute and log the new logic without changing live decisions
+- `entry_size`: let regime-aware entry vetoes and position sizing affect live behavior
+- `full`: let the full regime-aware candidate ladder and lifecycle policy control live actioning
+
+## Execution Layer
+
+The strategy core is Python-first, but live execution is delegated to a small Node bridge that uses the official Meteora TypeScript SDK.
+
+That separation keeps the system clean:
+- Python handles data fusion, scoring, journaling, and analysis
+- Node handles DLMM-specific transaction building and execution
+
+The live executor supports:
+- opening a new weighted DLMM position
+- closing an existing position
+- exact bin-weight execution plans
+- on-chain wallet snapshots and cycle-over-cycle delta capture
+
+## Safety And Operational Guardrails
+
+The live loop includes explicit safeguards:
+- one-position-only state model
+- untracked on-chain position detection
+- capital sufficiency checks before entry
+- executor-health gating
+- action cooldowns
+- hold / idle / rebalance gating based on adjusted EV, structure, and policy overrides
+
+This keeps the bot from treating every positive modeled edge as executable alpha.
+
+## Trade Journal And Analyzer
+
+Every cycle is written to `state/trade_journal.jsonl`.
+The journal records:
+- selected action
+- raw and adjusted EV
+- fee / IL / cost decomposition
+- market regime
+- agreement score
+- reentry probabilities
+- size multiplier
+- candidate family
+- counterfactual alternatives
+- execution status
+- realized execution deltas
+- calibration inclusion / exclusion state
+
+The analyzer script can summarize:
+- execution realized P/L
+- calibration drift
+- regime-level behavior
+- size-bucket behavior
+- counterfactual winner frequency
+- error categories
+- timing vs fees / IL
 
 ## Repository Layout
 
 ```text
 ai-liquidity-optimizer/
-├── src/ai_liquidity_optimizer/      # Python core (strategy + orchestration + adapters)
-├── executors/meteora_ts/            # Optional Node bridge for Meteora DLMM SDK execution
-├── tests/                           # Unit tests for strategy logic
+├── src/ai_liquidity_optimizer/
+│   ├── clients/              # Synth and Meteora API clients
+│   ├── execution/            # Python execution interfaces and bridges
+│   ├── strategy/             # Scoring, realism, and Synth market-state logic
+│   ├── cli.py                # CLI entrypoint
+│   ├── config.py             # Environment-driven settings
+│   ├── models.py             # Shared strategy and transport models
+│   └── orchestrator.py       # Main live decision loop
+├── executors/meteora_ts/     # Node / TypeScript Meteora executor
+├── scripts/                  # Analysis and handoff scripts
+├── tests/                    # Unit test suite
+├── state/                    # Local runtime state and trade journal
 ├── .env.example
 ├── requirements.txt
 ├── pyproject.toml
 └── README.md
 ```
 
-## Quick Start (Dry Run)
+## Quick Start
 
-1. Create a virtualenv (optional but recommended)
-2. Copy `.env.example` to `.env`
-3. Set `SYNTH_API_KEY`
-4. Keep `EXECUTOR=dry-run`
+### Prerequisites
 
-Run one cycle:
+- Python `3.9+`
+- Node `20.x`
+- a valid `SYNTH_API_KEY`
+- for live execution: Solana RPC access and a funded wallet
 
-```bash
-PYTHONPATH=src python -m ai_liquidity_optimizer --once
-```
-
-Run the periodic loop:
+### Dry Run
 
 ```bash
-PYTHONPATH=src python -m ai_liquidity_optimizer
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+PYTHONPATH=src python3 -m ai_liquidity_optimizer --env-file .env --once
 ```
 
-State is written to `state/optimizer_state.json` by default.
-Every cycle is also appended to `state/trade_journal.jsonl` (configurable).
-When using `EXECUTOR=meteora-node`, journal rows include on-chain wallet snapshots
-(`SOL`, `USDC`, and estimated total USD) plus cycle-over-cycle deltas.
-
-## Enable Real Meteora Execution (Optional)
-
-The Python app is the primary project; Meteora execution is delegated to the official TypeScript SDK via a small bridge.
-
-1. Install the bridge dependencies:
+### Continuous Local Run
 
 ```bash
-cd executors/meteora_ts
-npm ci --omit=dev
+PATH="/opt/homebrew/opt/node@20/bin:$PATH" \
+PYTHONPATH=src \
+python3 -m ai_liquidity_optimizer --env-file .env
 ```
 
-2. Configure in `.env`:
+### Live Meteora Execution
+
+In `.env`, set at minimum:
 - `EXECUTOR=meteora-node`
 - `SOLANA_RPC_URL`
 - `SOLANA_PRIVATE_KEY_B58`
 - `DEPOSIT_SOL_AMOUNT`
 - `DEPOSIT_USDC_AMOUNT`
 
-3. Run one cycle:
+Install the Node executor dependencies:
 
 ```bash
-PYTHONPATH=src python -m ai_liquidity_optimizer --once
+cd executors/meteora_ts
+npm ci --omit=dev
+cd ../..
 ```
 
-## Config Highlights
-
-- `REBALANCE_INTERVAL_MINUTES` (default `10`)
-- `RANGE_CHANGE_THRESHOLD_BPS` (rebalance trigger sensitivity)
-- `TRADE_JOURNAL_ENABLED` (default `true`)
-- `TRADE_JOURNAL_PATH` (default `state/trade_journal.jsonl`)
-- `METEORA_POOL_ADDRESS` (optional pool pinning)
-- `METEORA_POOL_QUERY` (used for discovery, default `SOL/USDC`)
-- `SYNTH_HORIZON` (default `24h`)
-
-## Analyze Trade Quality
-
-Generate a quick report from the JSONL trade journal:
+Then run:
 
 ```bash
-python scripts/analyze_trade_journal.py --path state/trade_journal.jsonl --since-hours 24
+PATH="/opt/homebrew/opt/node@20/bin:$PATH" \
+PYTHONPATH=src \
+python3 -m ai_liquidity_optimizer --env-file .env --once
 ```
 
-Useful options:
-- `--last 200` to analyze only the most recent cycles
-- `--show-errors 10` to inspect recent execution failures/rate limits
-- `--csv-out state/trade_cycle_metrics.csv` to export per-cycle metrics (modeled P/L + rebalance timing)
+## Useful Config
 
-## Limitations (MVP)
+Core runtime:
+- `REBALANCE_INTERVAL_MINUTES`
+- `RANGE_CHANGE_THRESHOLD_BPS`
+- `STATE_PATH`
+- `TRADE_JOURNAL_PATH`
+- `EXECUTOR`
 
+Synth market-state rollout:
+- `SYNTH_FUSION_HORIZONS`
+- `SYNTH_MARKET_STATE_STAGE`
+- `SYNTH_REGIME_*`
+- `SYNTH_SIZE_*`
+
+Realism and calibration:
+- `EV_REALISM_*`
+- `EV_CALIBRATION_MAX_REALIZED_POSITION_FRACTION`
+- `EV_CALIBRATION_MAX_ERROR_POSITION_FRACTION`
+- `EV_CALIBRATION_MAX_ERROR_MODEL_SCALE_MULTIPLE`
+
+Execution hygiene:
+- `EXECUTION_HEALTH_*`
+
+## Analyze Results
+
+Analyze the last 24 hours:
+
+```bash
+PYTHONPATH=src python3 scripts/analyze_trade_journal.py \
+  --path state/trade_journal.jsonl \
+  --since-hours 24 \
+  --show-errors 10
+```
+
+Export CSV:
+
+```bash
+PYTHONPATH=src python3 scripts/analyze_trade_journal.py \
+  --path state/trade_journal.jsonl \
+  --since-hours 24 \
+  --csv-out state/trade_cycle_metrics.csv
+```
+
+## Current Scope And Limitations
+
+This is a focused hackathon system, not a generalized production MM platform.
+
+Current intentional constraints:
 - SOL/USDC only
-- One position only
-- Uses a simple net-return proxy, not a full transaction-cost model
-- Real executor assumes the bot manages the position lifecycle and stores the active position metadata locally
-- Not production-hardened (no secret manager, no alerting, no robust tx retry policy)
+- one active position only
+- one venue only
+- no UI
+- relies on local state and journal persistence
+- still gathering live realized execution samples for the newer regime-aware controls
 
-## GitHub-Ready Notes
+## Why This Project Is Interesting
 
-- Includes `.gitignore`, `pyproject.toml`, `requirements.txt`, unit tests, and a basic GitHub Actions CI workflow.
-- Designed to run in dry-run mode by default for safe demo iteration.
+Most LP range tools are static and backward-looking.
+This project treats liquidity placement as a live probabilistic control problem:
+- use Synth to model path risk, not just spot drift
+- reason about reentry and breakout states explicitly
+- learn from realized execution outcomes instead of trusting model EV blindly
+- turn probabilistic forecasts into live on-chain actioning
+
+That is the core thesis of the system.
