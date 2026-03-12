@@ -1,4 +1,23 @@
 # AI Liquidity Optimizer
+```mermaid
+flowchart LR
+    A["Synth API<br/>lp-bounds<br/>lp-probabilities<br/>prediction-percentiles"] --> B["Python Orchestrator"]
+    C["Meteora API<br/>pool state<br/>fees<br/>liquidity"] --> B
+
+    B --> D["Multi-Horizon Synth Market State<br/>15m / 1h / 24h"]
+    D --> E["Candidate Ladder<br/>symmetric<br/>trend-skewed<br/>defensive<br/>hold<br/>idle"]
+    E --> F["Scenario EV Engine<br/>stay<br/>exit/reenter<br/>breakout up<br/>breakout down"]
+
+    G["Trade Journal<br/>decision rows<br/>execution outcomes"] --> H["Realism Calibration<br/>fee realism<br/>execution drag<br/>uncertainty"]
+    H --> F
+
+    F --> I["Decision Gate<br/>entry / hold / rotate / idle<br/>size multiplier<br/>safety checks"]
+    I --> J["Meteora TS Executor<br/>exact bin weights<br/>open / close position"]
+    J --> G
+
+    G --> K["Analyzer<br/>realized PnL<br/>regime buckets<br/>size buckets<br/>counterfactuals"]
+
+```
 
 A probabilistic liquidity placement and market-making bot for Meteora DLMM, powered by Synth forecast data.
 
@@ -300,22 +319,3 @@ This project treats liquidity placement as a live probabilistic control problem:
 
 That is the core thesis of the system.
 
-```mermaid
-flowchart LR
-    A["Synth API<br/>lp-bounds<br/>lp-probabilities<br/>prediction-percentiles"] --> B["Python Orchestrator"]
-    C["Meteora API<br/>pool state<br/>fees<br/>liquidity"] --> B
-
-    B --> D["Multi-Horizon Synth Market State<br/>15m / 1h / 24h"]
-    D --> E["Candidate Ladder<br/>symmetric<br/>trend-skewed<br/>defensive<br/>hold<br/>idle"]
-    E --> F["Scenario EV Engine<br/>stay<br/>exit/reenter<br/>breakout up<br/>breakout down"]
-
-    G["Trade Journal<br/>decision rows<br/>execution outcomes"] --> H["Realism Calibration<br/>fee realism<br/>execution drag<br/>uncertainty"]
-    H --> F
-
-    F --> I["Decision Gate<br/>entry / hold / rotate / idle<br/>size multiplier<br/>safety checks"]
-    I --> J["Meteora TS Executor<br/>exact bin weights<br/>open / close position"]
-    J --> G
-
-    G --> K["Analyzer<br/>realized PnL<br/>regime buckets<br/>size buckets<br/>counterfactuals"]
-
-```
